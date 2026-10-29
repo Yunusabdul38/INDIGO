@@ -1,0 +1,22 @@
+[package]
+name = "indigo-rail-ark-arkade"
+description = "The Ark pocket on Arkade: a Rail over ark-client, one Arkade operator each."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+indigo-domain.workspace = true
+indigo-rail.workspace = true
+ark-client.workspace = true
+ark-core.workspace = true
+ark-bdk-wallet.workspace = true
+async-trait.workspace = true
+bitcoin = { version = "0.32", features = ["rand-std"] }
+esplora-client = { version = "0.11", default-features = false, features = ["async", "async-https", "tokio"] }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
