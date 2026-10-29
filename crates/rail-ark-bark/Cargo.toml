@@ -1,0 +1,29 @@
+[package]
+name = "indigo-rail-ark-bark"
+description = "The Ark pocket on Bark: a Rail over bark-wallet, one Ark server each."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+indigo-domain.workspace = true
+indigo-rail.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+sha2.workspace = true
+# Only `sync`: the workspace entry adds a runtime that browsers can't run.
+tokio = { version = "1", default-features = false, features = ["sync"] }
+# The browser build adds "wasm-web" and "indexed-db" from outside this
+# workspace (apps/web-ark-check): fedimint-sdk pins wasm-bindgen to a version
+# those features can't use, and Cargo resolves every target into one lockfile.
+bark-wallet = { version = "0.8.0", default-features = false, features = ["rand", "onchain-bdk"] }
+
+# Natively Bark connects over gRPC and keeps SQLite.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+bark-wallet = { version = "0.8.0", default-features = false, features = ["rand", "sqlite", "native", "tls-webpki-roots", "onchain-bdk", "bitcoind-rpc"] }
+
+# bark-wallet's library is named `bark`, which cargo-machete cannot see.
+[package.metadata.cargo-machete]
+ignored = ["bark-wallet"]
