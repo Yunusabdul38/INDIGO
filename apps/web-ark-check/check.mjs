@@ -3,8 +3,7 @@
 // profile in PROFILE keeps IndexedDB between runs, as a browser would.
 //
 //   node check.mjs <base url> <profile dir> <words> <action> [arg] [arg2]
-//   KILL_AFTER_MS=1500 node check.mjs ...   kills Chrome mid-action (a closed tab)
-//   NETWORK=regtest node check.mjs ...       the local regtest stack (default: signet)
+//   NETWORK=signet node check.mjs ...   Second's public signet (default: regtest)
 import { spawn } from "node:child_process";
 
 const [base, profile, words, action, arg = "", arg2 = ""] = process.argv.slice(2);
@@ -52,15 +51,8 @@ ws.addEventListener("message", (m) => {
 });
 await call("Runtime.enable");
 
-const q = new URLSearchParams({ network: process.env.NETWORK || "signet", words, action, arg, arg2 });
+const q = new URLSearchParams({ network: process.env.NETWORK || "regtest", words, action, arg, arg2 });
 await call("Page.navigate", { url: `${base}/index.html?${q}` });
-
-if (process.env.KILL_AFTER_MS) {
-  await sleep(Number(process.env.KILL_AFTER_MS));
-  proc.kill("SIGKILL");
-  console.log("KILLED");
-  process.exit(0);
-}
 
 const deadline = Date.now() + 5 * 60 * 1000;
 let out = "running…";

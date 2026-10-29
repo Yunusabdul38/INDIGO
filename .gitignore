@@ -1,8 +1,7 @@
-# Build output: Rust targets at any depth (workspace and every spike) and the
+# Build output: Rust targets at any depth (workspace and the browser app) and the
 # generated browser bindings. Cargo.lock files ARE tracked: they hold pins
 # (libc 0.2.189 for iOS) that a fresh resolve would undo.
 target/
-spikes/wasm/pkg/
 apps/web-ark-check/pkg/
 
 # Local environment and secrets. Regtest credentials in infra/ are test-only.

@@ -16,13 +16,13 @@ PORT=8724
 trap 'kill $(jobs -p) 2>/dev/null; pkill -f "user-data-dir=$PROFILE" 2>/dev/null; rm -rf "$PROFILE" "$WORK"' EXIT
 BWORDS=$("$INDIGO" new-test-seed 2>/dev/null | tail -1)
 
-web() { NETWORK=regtest node "$WEB/check.mjs" "http://localhost:$PORT" "$PROFILE" "$BWORDS" "$@" 2>/dev/null | tail -1 || true; }
+web() { node "$WEB/check.mjs" "http://localhost:$PORT" "$PROFILE" "$BWORDS" "$@" 2>/dev/null | tail -1 || true; }
 wbalance() { web balance | sed -n 's/^OK \([0-9.]*\) sats spendable.*/\1/p'; }
 
 echo "Web wallet on regtest"
 
 echo "w.1 paid over Lightning in the browser"
-NETWORK=regtest node "$WEB/check.mjs" "http://localhost:$PORT" "$PROFILE" "$BWORDS" receive-wait 20000 >"$WORK/web.log" 2>/dev/null &
+node "$WEB/check.mjs" "http://localhost:$PORT" "$PROFILE" "$BWORDS" receive-wait 20000 >"$WORK/web.log" 2>/dev/null &
 pid=$!
 inv=""
 for _ in $(seq 300); do inv=$(sed -n 's/^INVOICE //p' "$WORK/web.log"); [ -n "$inv" ] && break; sleep 0.2; done

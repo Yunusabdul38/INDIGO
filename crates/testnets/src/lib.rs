@@ -1,5 +1,5 @@
-//! Endpoints of the public test networks and the local regtest stack, plus
-//! test-only descriptors. One place for every test, spike and app, so a
+//! Endpoints of the public test networks and the local regtest stack. One
+//! place for every test and app, so a
 //! rotated invite or a moved mint is changed once.
 
 /// Mutinynet (a signet with 30-second blocks) and its public test services.
@@ -49,8 +49,3 @@ pub mod regtest {
     pub const LND_REST: &str = "https://127.0.0.1:18080";
 }
 
-/// BIP84 test descriptors from a well-known test vector. Never hold real funds.
-pub mod test_descriptors {
-    pub const BIP84_RECEIVE: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/0/*)";
-    pub const BIP84_CHANGE: &str = "wpkh(tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L/84'/1'/0'/1/*)";
-}

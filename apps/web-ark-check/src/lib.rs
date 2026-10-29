@@ -1,8 +1,7 @@
 //! INDIGO's Bark pocket in a browser, its data in IndexedDB. `run()` does one
-//! action, like one CLI command. Two pages use it: index.html for test 3.12
-//! on Second's public signet (`check.mjs` drives it from headless Chrome,
-//! whose profile keeps IndexedDB between loads), and wallet.html, the web
-//! demo on the local regtest stack.
+//! action, like one CLI command. wallet.html is the web demo; index.html runs
+//! one action from its URL, for `check.mjs` (tests/web-regtest.sh) to drive
+//! from headless Chrome, whose profile keeps IndexedDB between loads.
 //!
 //! Build (Apple's `ar` can't package the WebAssembly C code; Homebrew LLVM can):
 //!   RUSTFLAGS='--cfg getrandom_backend="wasm_js"' \

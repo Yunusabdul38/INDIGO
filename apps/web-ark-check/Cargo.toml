@@ -1,6 +1,6 @@
 [package]
 name = "web-ark-check"
-description = "Phase 3 test 3.12: the Bark pocket in a browser, its data in IndexedDB."
+description = "The web demo: INDIGO's Ark pocket in a browser, its data in IndexedDB."
 version = "0.0.0"
 edition = "2024"
 publish = false

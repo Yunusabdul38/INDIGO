@@ -9,7 +9,7 @@
   try {
     await init();
     const show = (line) => { out.textContent = line; };
-    out.textContent = "OK " + (await run(q.get("network") || "signet", q.get("words"), q.get("action"), q.get("arg") || "", q.get("arg2") || "", show));
+    out.textContent = "OK " + (await run(q.get("network") || "regtest", q.get("words"), q.get("action"), q.get("arg") || "", q.get("arg2") || "", show));
   } catch (e) {
     out.textContent = "FAIL " + (e && e.message ? e.message : e);
   }

@@ -1,7 +1,8 @@
 [workspace]
 resolver = "3"
-# Spikes and the browser check keep their own lockfiles so they cannot move the main dependency set.
-exclude = ["spikes", "apps/web-ark-check"]
+# The browser app keeps its own lockfile: Bark's browser features need a newer
+# wasm-bindgen than fedimint-sdk allows here.
+exclude = ["apps/web-ark-check"]
 members = [
     "crates/domain",
     "crates/rail",

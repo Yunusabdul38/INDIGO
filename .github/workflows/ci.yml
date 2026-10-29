@@ -45,7 +45,9 @@ jobs:
       # Phase 2: tests 2.1-2.11 (Fedimint pocket, moves, kill at every state),
       # then 50 random moves with random kills.
       - run: tests/phase2.sh regtest
-      - run: tests/phase2-soak.sh regtest 50
+      - run: tests/phase3.sh regtest
+      - run: tests/phase4-route.sh regtest
+      - run: tests/restore.sh regtest
       - if: failure()
         run: docker compose -f infra/docker-compose.regtest.yml logs --tail 200
       - if: always()

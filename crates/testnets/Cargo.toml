@@ -1,6 +1,6 @@
 [package]
 name = "indigo-testnets"
-description = "Endpoints of the public test networks and the local regtest stack, plus test-only descriptors. One place for every spike, test and the CLI."
+description = "Endpoints of the public test networks and the local regtest stack. One place for every test and app."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
