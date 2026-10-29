@@ -1,0 +1,16 @@
+[package]
+name = "indigo-domain"
+description = "Shared types: amounts, ids, operation status, errors."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+lightning-invoice.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = "0.3"
