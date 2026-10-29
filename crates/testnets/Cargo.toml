@@ -1,0 +1,11 @@
+[package]
+name = "indigo-testnets"
+description = "Endpoints of the public test networks and the local regtest stack, plus test-only descriptors. One place for every spike, test and the CLI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# No dependencies, so it builds for every target, the browser included.
+[dependencies]
