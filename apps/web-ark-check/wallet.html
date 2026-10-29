@@ -39,6 +39,11 @@
   .tabs { display: flex; background: var(--bg); border-radius: 10px; padding: 2px; margin-bottom: 12px; }
   .tabs button { flex: 1; border-radius: 8px; padding: 6px; background: none; color: var(--text); }
   .tabs button.on { background: var(--card); font-weight: 600; }
+  .pocket { display: flex; justify-content: space-between; align-items: center; gap: 12px;
+            padding: 12px 0; border-top: 1px solid var(--line); }
+  .pocket:first-of-type { border-top: 0; }
+  .pocket .amount { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .pocket.off { opacity: .5; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -80,10 +85,10 @@
       <div class="tabs"><button class="on" data-tab="ln">Lightning</button><button data-tab="ark">Ark</button></div>
       <div data-pane="ln">
         <label for="recv-sats">Amount in sats</label>
-        <input id="recv-sats" inputmode="numeric" value="10000">
+        <input id="recv-sats" inputmode="numeric" placeholder="10000">
         <p></p>
         <button class="primary" id="recv-go">Create invoice</button>
-        <button class="link" id="faucet">Pay it from outside (test network)</button>
+        <button class="link" id="faucet">Get it from the test faucet</button>
       </div>
       <div data-pane="ark" hidden>
         <p class="muted small">Another Ark wallet pays this address directly, no Lightning needed.</p>
@@ -96,7 +101,8 @@
     <div class="card" id="send" hidden>
       <h2>Send</h2>
       <label for="send-to">Lightning invoice or Ark address</label>
-      <textarea id="send-to" rows="3" spellcheck="false"></textarea>
+      <textarea id="send-to" rows="3" spellcheck="false" placeholder="Paste it here"></textarea>
+      <div class="small" id="send-hint"></div>
       <div id="send-amount-box" hidden>
         <label for="send-sats">Amount in sats</label>
         <input id="send-sats" inputmode="numeric">
@@ -104,6 +110,22 @@
       <p></p>
       <button class="primary" id="send-go">Send</button>
       <div id="send-out"></div>
+    </div>
+
+    <div class="card">
+      <h2>Pockets</h2>
+      <div class="pocket">
+        <div><div>Ark</div><div class="muted small">Self-custody · exit to Bitcoin any time</div></div>
+        <div class="amount" id="pocket-ark">…</div>
+      </div>
+      <div class="pocket off">
+        <div><div>Cashu</div><div class="muted small">Ecash from a mint · in the iOS app, coming to the web</div></div>
+        <div class="amount">—</div>
+      </div>
+      <div class="pocket off">
+        <div><div>Fedimint</div><div class="muted small">Ecash from a federation · in the iOS app, coming to the web</div></div>
+        <div class="amount">—</div>
+      </div>
     </div>
 
     <div class="card">
@@ -116,8 +138,6 @@
 </main>
 
 <script type="module">
-  import init, { run, new_words } from "./pkg/web_ark_check.js";
-
   const OUTSIDE = "http://127.0.0.1:8733"; // demo/outside-world.py
   const $ = (id) => document.getElementById(id);
   const store = {
@@ -125,26 +145,62 @@
     set: (k, v) => { try { localStorage.setItem("indigo." + k, v); } catch {} },
     clear: () => { try { localStorage.removeItem("indigo.name"); localStorage.removeItem("indigo.words"); } catch {} },
   };
-
-  // One wallet action at a time: each opens the wallet's IndexedDB store.
-  let queue = Promise.resolve();
-  const wallet = (action, arg = "", arg2 = "", show = () => {}) => {
-    const next = queue.then(() => run("regtest", store.get("words"), action, String(arg), String(arg2), show));
-    queue = next.catch(() => {});
-    return next;
-  };
-  const plain = (e) => (e && e.message ? e.message : String(e));
   const sats = (n) => Number(n).toLocaleString("en-US", { maximumFractionDigits: 3 }) + " sats";
   const say = (el, text, cls) => { el.className = cls || ""; el.textContent = text; };
 
+  // The wallet module. After a failure it is loaded afresh: a WebAssembly
+  // instance that hit an error can be left unusable, and a fresh one reopens
+  // the wallet from IndexedDB as if the page had been reloaded.
+  let mod = null;
+  async function load(fresh) {
+    mod = await import("./pkg/web_ark_check.js" + (fresh ? "?v=" + Date.now() : ""));
+    await mod.default();
+  }
+
+  // One wallet action at a time: each opens the wallet's IndexedDB store.
+  let queue = Promise.resolve();
+  let broken = false;
+  const wallet = (action, arg = "", arg2 = "", show = () => {}) => {
+    const next = queue.then(async () => {
+      if (broken) { await load(true); broken = false; }
+      try {
+        return await mod.run("regtest", store.get("words"), action, String(arg), String(arg2), show);
+      } catch (e) { broken = true; throw e; }
+    });
+    queue = next.catch(() => {});
+    return next;
+  };
+
+  // Errors as a person should read them.
+  const btcToSats = (btc) => Math.round(Number(btc) * 1e8);
+  function plain(e) {
+    const text = e && e.message ? e.message : String(e);
+    const short = text.match(/Needed ([\d.]+) BTC but ([\d.]+) BTC is available/);
+    if (short) return `Not enough funds: this needs ${sats(btcToSats(short[1]))} with fees, and you have ${sats(btcToSats(short[2]))}.`;
+    if (/expired/i.test(text)) return "This invoice has expired. Ask for a new one.";
+    if (/already (been )?paid|duplicate/i.test(text)) return "This invoice has already been paid.";
+    if (/bech32|checksum|invalid (invoice|address)|parse/i.test(text)) return "That isn’t a valid Lightning invoice or Ark address.";
+    if (/fetch|network|connect|sending request|timed? ?out/i.test(text)) return "Can’t reach the Ark server. Check the test network is running, then try again.";
+    if (/unreachable|RuntimeError|panicked/i.test(text)) return "The wallet hit an internal error and restarted. Please try again.";
+    return "That didn’t work: " + text.replace(/^ark-bark:\S+: /, "");
+  }
+  // "… Completed { amount: Msat(20000000), fee: Msat(140000) }" → sats
+  const completed = (result) => {
+    const m = result.match(/Completed \{ amount: Msat\((\d+)\), fee: Msat\((\d+)\)/);
+    return m ? { amount: Number(m[1]) / 1000, fee: Number(m[2]) / 1000 } : null;
+  };
+
+  let spendable = 0;
   async function refresh() {
     try {
       // "<n> sats spendable, <m> sats pending" (msat decimals possible)
       const out = await wallet("balance");
-      const [spendable, pending] = out.match(/[\d.]+/g).map(Number);
-      $("balance").textContent = sats(spendable);
+      const [have, pending] = out.match(/[\d.]+/g).map(Number);
+      spendable = have;
+      $("balance").textContent = sats(have);
+      $("pocket-ark").textContent = sats(have);
       $("pending").textContent = pending > 0 ? sats(pending) + " on its way" : "";
-    } catch (e) { $("balance").textContent = "—"; $("pending").textContent = plain(e); }
+    } catch (e) { $("pending").textContent = plain(e); }
   }
 
   function showHome() {
@@ -165,7 +221,7 @@
   $("start").onclick = () => {
     const name = $("name").value.trim();
     if (!name) return $("name").focus();
-    const words = restoring ? $("words-in").value.trim().toLowerCase().split(/\s+/).join(" ") : new_words();
+    const words = restoring ? $("words-in").value.trim().toLowerCase().split(/\s+/).join(" ") : mod.new_words();
     if (words.split(" ").length !== 12) return alert("Those are not 12 recovery words.");
     store.set("name", name);
     store.set("words", words);
@@ -173,23 +229,35 @@
     if (!restoring) { $("words").hidden = false; $("words").textContent = words; }
   };
 
-  // Panels
+  // Panels: opening one starts it fresh.
+  function reset(panel) {
+    if (panel === "send") {
+      $("send-to").value = ""; $("send-sats").value = "";
+      $("send-amount-box").hidden = true; say($("send-hint"), "", "small"); say($("send-out"), "");
+    } else {
+      $("recv-sats").value = ""; say($("recv-out"), "");
+    }
+  }
   document.querySelectorAll("[data-open]").forEach((b) => (b.onclick = () => {
     const id = b.dataset.open;
-    for (const p of ["receive", "send"]) $(p).hidden = p !== id || !$(p).hidden;
-    if (id === "receive" && $("ark-address").textContent === "…") loadAddress();
+    for (const p of ["receive", "send"]) {
+      const open = p === id && $(p).hidden;
+      if (open) reset(p);
+      $(p).hidden = !open;
+    }
+    if (id === "receive" && !$("ark-address").dataset.ok) loadAddress();
   }));
   document.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => {
     document.querySelectorAll("[data-tab]").forEach((t) => t.classList.toggle("on", t === b));
     document.querySelectorAll("[data-pane]").forEach((p) => (p.hidden = p.dataset.pane !== b.dataset.tab));
   }));
   document.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = async () => {
-    await navigator.clipboard.writeText($(b.dataset.copy).textContent);
-    b.textContent = "Copied";
+    try { await navigator.clipboard.writeText($(b.dataset.copy).textContent); b.textContent = "Copied"; }
+    catch { b.textContent = "Select and copy it by hand"; }
   }));
 
   async function loadAddress() {
-    try { $("ark-address").textContent = await wallet("address"); }
+    try { $("ark-address").textContent = await wallet("address"); $("ark-address").dataset.ok = "1"; }
     catch (e) { $("ark-address").textContent = plain(e); }
   }
 
@@ -197,22 +265,26 @@
   // cancels a payment its wallet isn't there to take).
   async function receive(payFromOutside) {
     const out = $("recv-out");
-    const amount = parseInt($("recv-sats").value, 10);
-    if (!(amount > 0)) return;
+    const amount = parseInt($("recv-sats").value || $("recv-sats").placeholder, 10);
+    if (!(amount > 0)) return say(out, "Enter an amount in sats.", "err small");
     $("recv-go").disabled = $("faucet").disabled = true;
     say(out, "Creating invoice…", "muted small");
     try {
       const result = await wallet("receive-wait", amount, "", (line) => {
         const invoice = line.replace(/^INVOICE /, "");
+        out.className = "";
         out.innerHTML = '<div class="code"></div><div class="muted small">Waiting for payment…</div>';
         out.firstChild.textContent = invoice;
         if (payFromOutside) {
           fetch(OUTSIDE + "/pay", { method: "POST", body: JSON.stringify({ invoice }) })
-            .catch((e) => say(out, "The outside world is not running: " + plain(e), "err small"));
+            .catch(() => say(out, "The test faucet isn’t running (demo/outside-world.py).", "err small"));
         }
       });
-      const done = /Completed/.test(result);
-      say(out, done ? "Received " + sats(amount) : "Not paid: " + result, done ? "ok" : "err small");
+      const done = completed(result);
+      if (!done) say(out, "Not paid in time. Create a new invoice to try again.", "err small");
+      else if (done.fee > 0) say(out, `Received ${sats(done.amount - done.fee)} (the Ark server kept ${sats(done.fee)} as its fee).`, "ok");
+      else say(out, `Received ${sats(done.amount)}.`, "ok");
+      if (done) $("recv-sats").value = "";
     } catch (e) { say(out, plain(e), "err small"); }
     $("recv-go").disabled = $("faucet").disabled = false;
     refresh();
@@ -220,24 +292,53 @@
   $("recv-go").onclick = () => receive(false);
   $("faucet").onclick = () => receive(true);
 
-  // Send: an invoice carries its amount; an Ark address needs one.
-  const isInvoice = (t) => /^(lightning:)?ln(bc|tb|bcrt)/i.test(t);
+  // Send: say what was pasted, and catch what can't work before trying it.
+  function kind(text) {
+    const t = text.trim().replace(/^lightning:/i, "");
+    const inv = t.match(/^ln(bcrt|bc|tbs|tb)(\d+)([munp]?)1/i);
+    if (inv) {
+      const btc = Number(inv[2]) * ({ m: 1e-3, u: 1e-6, n: 1e-9, p: 1e-12 }[inv[3].toLowerCase()] ?? 1);
+      return { type: "invoice", text: t, amount: Math.round(btc * 1e8) };
+    }
+    if (/^ln(bcrt|bc|tbs|tb)1/i.test(t)) return { type: "invoice", text: t, amount: null };
+    if (/^t?ark1/i.test(t)) return { type: "ark", text: t };
+    if (/^(bc1|tb1|bcrt1)/i.test(t) || /^[mn2][1-9A-HJ-NP-Za-km-z]{25,34}$/.test(t)) return { type: "onchain" };
+    if (/^cashu/i.test(t) || /^fedimint/i.test(t)) return { type: "ecash" };
+    return t ? { type: "unknown" } : null;
+  }
   $("send-to").oninput = () => {
-    const t = $("send-to").value.trim();
-    $("send-amount-box").hidden = !t || isInvoice(t);
+    const k = kind($("send-to").value);
+    const hint = $("send-hint");
+    $("send-amount-box").hidden = !k || k.type !== "ark";
+    say($("send-out"), "");
+    if (!k) say(hint, "", "small");
+    else if (k.type === "invoice") say(hint, k.amount ? `Lightning invoice for ${sats(k.amount)}` : "Lightning invoice with no amount", "muted small");
+    else if (k.type === "ark") say(hint, "Ark address", "muted small");
+    else if (k.type === "onchain") say(hint, "A Bitcoin address: on-chain sends aren’t in the web wallet yet.", "err small");
+    else if (k.type === "ecash") say(hint, "That’s ecash to redeem: Cashu and Fedimint aren’t in the web wallet yet.", "err small");
+    else say(hint, "Not a Lightning invoice or an Ark address.", "err small");
   };
   $("send-go").onclick = async () => {
-    const to = $("send-to").value.trim().replace(/^lightning:/i, "");
+    const k = kind($("send-to").value);
     const out = $("send-out");
-    if (!to) return;
+    if (!k) return say(out, "Paste a Lightning invoice or an Ark address.", "err small");
+    if (k.type !== "invoice" && k.type !== "ark") return say(out, $("send-hint").textContent, "err small");
+    if (k.type === "invoice" && !k.amount) return say(out, "This invoice has no amount. Ask for one that includes it.", "err small");
+    const amount = k.type === "invoice" ? k.amount : parseInt($("send-sats").value, 10);
+    if (!(amount > 0)) return say(out, "Enter an amount in sats.", "err small");
+    if (amount > spendable) return say(out, `Not enough funds: this needs ${sats(amount)}, and you have ${sats(spendable)}.`, "err small");
     $("send-go").disabled = true;
     say(out, "Sending…", "muted small");
     try {
-      const result = isInvoice(to)
-        ? await wallet("pay", to)
-        : await wallet("pay-address", to, parseInt($("send-sats").value, 10));
-      const done = /Completed/.test(result);
-      say(out, done ? "Paid" : "Payment " + result.split(" ").slice(1).join(" ").toLowerCase(), done ? "ok" : "warn small");
+      const result = k.type === "invoice" ? await wallet("pay", k.text) : await wallet("pay-address", k.text, amount);
+      const done = completed(result);
+      if (done) {
+        say(out, `Paid ${sats(done.amount)}` + (done.fee > 0 ? ` (fee ${sats(done.fee)}).` : "."), "ok");
+        $("send-to").value = ""; $("send-sats").value = "";
+        $("send-amount-box").hidden = true; say($("send-hint"), "", "small");
+      } else {
+        say(out, "The payment is still on its way. Your balance updates when it settles.", "warn small");
+      }
     } catch (e) { say(out, plain(e), "err small"); }
     $("send-go").disabled = false;
     refresh();
@@ -252,7 +353,7 @@
     location.reload();
   };
 
-  await init();
+  await load(false);
   if (store.get("words")) showHome(); else $("welcome").hidden = false;
 </script>
 </body>
