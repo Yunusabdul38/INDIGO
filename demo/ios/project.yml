@@ -1,0 +1,58 @@
+# The iOS demo app. Generate the Xcode project with `xcodegen` after
+# demo/ios/build-rust.sh has built IndigoFFI.xcframework and the bindings.
+name: IndigoDemo
+options:
+  bundleIdPrefix: dev.indigo
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  IndigoDemo:
+    type: application
+    platform: iOS
+    sources:
+      - IndigoDemo
+      - Generated/indigo_ffi.swift
+    dependencies:
+      - framework: IndigoFFI.xcframework
+        embed: false
+      - sdk: SystemConfiguration.framework
+      - sdk: Security.framework
+      - sdk: Network.framework
+      - sdk: libresolv.tbd
+    info:
+      path: IndigoDemo/Info.plist
+      properties:
+        CFBundleDisplayName: INDIGO
+        NSFaceIDUsageDescription: Face ID protects your recovery phrase.
+        UILaunchScreen: {}
+        # The demo talks to the regtest stack and the outside-world helper on
+        # this Mac over plain HTTP.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.indigo.demo
+        SWIFT_VERSION: "5.0"
+        OTHER_LDFLAGS: "-lc++"
+  # Taps through the app like a person: tests/ios-ui.sh runs it.
+  IndigoDemoUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [IndigoDemoUITests]
+    dependencies:
+      - target: IndigoDemo
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.indigo.demo.uitests
+        SWIFT_VERSION: "5.0"
+        TEST_TARGET_NAME: IndigoDemo
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  IndigoDemo:
+    build:
+      targets:
+        IndigoDemo: all
+        IndigoDemoUITests: [test]
+    test:
+      targets: [IndigoDemoUITests]
