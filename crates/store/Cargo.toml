@@ -1,0 +1,13 @@
+[package]
+name = "indigo-store"
+description = "Persistence: the operation log and the append-only journal."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# SQLite for now; Phase 5 puts this behind an interface with a browser backend.
+[dependencies]
+indigo-domain.workspace = true
+rusqlite.workspace = true
