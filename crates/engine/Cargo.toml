@@ -1,0 +1,19 @@
+[package]
+name = "indigo-engine"
+description = "Intent state machine for moves between pockets."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+indigo-domain.workspace = true
+indigo-rail.workspace = true
+indigo-store.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+uuid = { workspace = true, features = ["v7"] }
+
+[dev-dependencies]
+tokio.workspace = true
