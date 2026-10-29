@@ -2,7 +2,7 @@
 
 Before you go on: `demo/start.sh --fresh` (about two minutes from a warm Mac,
 longer if Docker has to start). It ends with "Ready." and both phones on the
-welcome screen. Left phone is Alice (iPhone 16), right phone is Bob (iPhone 16 Pro).
+welcome screen. Left phone is Alice (iPhone 16), right phone is Bob (iPhone 18 Pro).
 
 ## 1. The problem (30 s, no phones)
 
@@ -58,7 +58,8 @@ welcome screen. Left phone is Alice (iPhone 16), right phone is Bob (iPhone 16 P
 ## Optional: Bob on the web (60 s)
 
 - Open http://127.0.0.1:8090/wallet.html, type **Bob (web)**, **Create a new wallet**.
-- **Receive → Pay it from outside** with 10,000. "Received 10,000 sats".
+- **Receive**, type 10,000, **Get it from the test faucet**. It shows what
+  arrived after the Ark server's small Lightning fee.
   > Same Rust core, compiled to WebAssembly, running in a browser tab.
 - **Receive → Ark → Copy**. On Alice's phone: **Send**, paste, 1,000, **Send**.
   > The phone pays the browser over Ark. Same protocols, any platform.

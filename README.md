@@ -1,173 +1,273 @@
 # INDIGO
 
-One Bitcoin wallet SDK for iOS, Android and the web that holds every layer
-in one wallet: **Cashu** ecash, **Fedimint** federations, **Ark** (Bark and
-Arkade), on-chain bitcoin and **Lightning** between them.
+**One SDK for every Bitcoin layer.**
 
-- **One wallet, one backup.** 12 recovery words cover every pocket. Restoring
-  on a new device asks the mint, rescans the federation and asks the Ark
-  server; every pocket comes back.
-- **Users don't pick pockets.** Payments go out from the cheapest pocket that
-  covers them. If none does alone, INDIGO first moves money into one, then pays.
-  Incoming money lands where it fits: small amounts in ecash, large ones in Ark.
-- **Every sat accounted for.** Every operation and every move between pockets
-  is journaled and recovers from a crash at any step. An audit compares each
-  pocket's balance with its journal, to the sat.
-- **No central switch.** No INDIGO server, no account. The developer picks
-  the mints, federations and Ark servers; the words never leave the device.
-- Bitcoin networks only. Fiat is optional and comes in over Lightning
-  through a provider the developer chooses (planned).
+INDIGO puts Cashu ecash, Fedimint federations, Ark (Bark and Arkade), on-chain
+bitcoin and Lightning behind one wallet, with one backup. Developers integrate
+it once, through native bindings for iOS and Android or WebAssembly for the
+web, and their users get every layer without having to know which one they
+are using.
 
-## Get started
+> **Status:** working prototype on test networks (regtest, Mutinynet, Second's
+> signet). Not yet audited and not for mainnet funds.
 
-You need macOS with:
+## Why INDIGO
 
-- [Rust](https://rustup.rs) 1.85 or newer
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-- Python 3
+- **One wallet, one backup.** A single 12-word phrase restores every pocket on
+  a new device: the mint, the federation and the Ark server are each asked what
+  the words own.
+- **No pocket picking.** Payments go out from the cheapest pocket that covers
+  them. When none does alone, INDIGO moves money into one first, then pays.
+- **Every sat accounted for.** Every operation is journaled before it starts
+  and recovers from a crash at any step. An audit checks each pocket's balance
+  against its journal, to the sat.
+- **No central server.** No INDIGO account or kill switch. The developer chooses
+  the mints, federations and Ark servers; the recovery words never leave the
+  device.
 
-For the iOS demo, also Xcode, [xcodegen](https://github.com/yonaskolb/XcodeGen)
-(`brew install xcodegen`) and `rustup target add aarch64-apple-ios-sim`.
-For the web demo, see [Web](#web-the-ark-pocket-in-a-browser).
+## Quick start
 
-Then, from the repository root:
+**Requirements:** macOS on Apple silicon, [Rust](https://rustup.rs) 1.85+,
+[Docker Desktop](https://www.docker.com/products/docker-desktop/) and Python 3.
+For the iOS demo also Xcode, `brew install xcodegen` and
+`rustup target add aarch64-apple-ios-sim`.
 
-    demo/start.sh
+```sh
+demo/start.sh            # start everything; ends with "Ready."
+demo/start.sh --fresh    # the same, with both phones starting empty
+demo/stop.sh             # stop everything (chain data kept)
+demo/stop.sh --wipe      # stop and delete the regtest chain data
+```
 
-On the first run this takes several minutes: it builds the Rust workspace and
-starts the regtest stack. It ends with **Ready.**, after it has:
+`demo/start.sh` starts Docker and a local **regtest** network (Bitcoin Core,
+LND and Core Lightning, a Cashu mint, a Fedimint federation, an Ark server),
+funds it and opens its channels. It then starts the *outside world*
+(`demo/outside-world.py`, a faucet and bill issuer on `127.0.0.1:8733`), serves
+the web wallet, builds the CLI, and opens the iOS app on two Simulators. It is
+safe to run again: only what is down gets started. Logs go to `demo/.run/`.
 
-1. started Docker and the local **regtest** stack: bitcoind, Lightning nodes,
-   a Cashu mint, a Fedimint federation with its Lightning gateway, and an Ark
-   (Bark) server;
-2. funded it and opened the Lightning channels (`infra/regtest-setup.sh`);
-3. started the **outside world** on 127.0.0.1:8733 (`demo/outside-world.py`):
-   the faucet, shops that send bills, and a miner;
-4. served the web wallet, if built, on http://127.0.0.1:8090/wallet.html;
-5. built the CLI (`target/debug/indigo`);
-6. built the iOS app and opened it on two Simulators: Alice on "iPhone 16",
-   Bob on "iPhone 16 Pro".
+The five-minute pitch, with what to tap and what to say, is in
+[demo/PITCH.md](demo/PITCH.md).
 
-`demo/start.sh --fresh` does the same with both phones starting empty. It is
-safe to run again: whatever is already up is left as it is. Logs go to
-`demo/.run/`.
+## Demos
 
-The five-minute pitch, with what to tap and what to say:
-**[demo/PITCH.md](demo/PITCH.md)**.
+All three demos share the regtest network, so the phones, the browser and the
+terminal can pay one another.
 
-Everything here is test money on a private regtest chain.
+### iOS
 
-## The demos
+Two people on two phones: **Alice** on *iPhone 16* (iOS 18) and **Bob** on
+*iPhone 18 Pro* (iOS 27). Create them if they are missing:
 
-All three run on the same local regtest stack, so the phones, the terminal
-and the browser can pay each other.
+```sh
+xcrun simctl create "iPhone 16" "iPhone 16"
+xcrun simctl create "iPhone 18 Pro" "iPhone 18 Pro"
+```
 
-### iOS: two people, two phones
+In each app, type a name and use it freely:
 
-Each phone is one person with one wallet. Type a name, then:
+| | |
+|---|---|
+| **Receive** | A Lightning invoice (INDIGO picks the pocket, or you do), an Ark address, an on-chain address, or redeem ecash |
+| **Send** | Paste an invoice or Ark address, or create an ecash note. Any top-up INDIGO made first is listed in the result |
+| **⋯ menu** | Test sats, the audit ("Check the books"), the recovery phrase, delete the wallet |
+| **Backup** | The 12 words are shown once and three are asked back. "Back up later" is allowed; the app warns once money arrives |
+| **Lost phone** | Delete the wallet (typing its name to confirm), then restore from the 12 words: same balance, audit still matches |
 
-- **Receive**: a Lightning invoice (into the pocket INDIGO picks, or one you
-  pick), your Ark address, an on-chain address, or redeem ecash.
-- **Send**: paste an invoice or Ark address, or create an ecash note.
-  "Pay from: Automatic" lets INDIGO pick; the result lists any money it moved
-  first. Or pick a pocket that has money.
-- **⋯ menu**: get 50,000 test sats, check the books, show the recovery phrase
-  (Face ID or passcode first), delete the wallet.
+The Simulators share the Mac's clipboard, so a code copied on one phone pastes
+on the other. Xcode 27's DeviceHub shows one phone per window: `start.sh` opens
+two, and you pick *iPhone 18 Pro* in the second.
 
-**Backup.** A new wallet shows its 12 words and asks for three of them back.
-"Back up later" is allowed: the home screen keeps reminding you, more strongly
-once money arrives, and asks once when it does. The words live only in the
-phone's Keychain (not in backups or iCloud).
+<details>
+<summary>Building the app by hand</summary>
 
-**Lost phone.** ⋯ → Delete this wallet (type the name to confirm), then
-"I have a recovery phrase" and the 12 words. Same balance, books still match.
+```sh
+demo/ios/build-rust.sh     # Rust core → XCFramework, Swift bindings, Xcode project
 
-Copy on one Simulator, paste on the other: they share the Mac's clipboard.
-Every code also shows as a QR code with a Share button.
+ALICE=$(xcrun simctl list devices available | grep -F '    iPhone 16 (' | grep -oE '[0-9A-F-]{36}' | head -1)
+xcodebuild -project demo/ios/IndigoDemo.xcodeproj -scheme IndigoDemo \
+  -destination "id=$ALICE" -derivedDataPath demo/ios/build/app build -quiet
+APP=demo/ios/build/app/Build/Products/Debug-iphonesimulator/IndigoDemo.app
+for phone in "iPhone 16" "iPhone 18 Pro"; do
+  xcrun simctl boot "$phone" 2>/dev/null
+  xcrun simctl install "$phone" "$APP"
+  xcrun simctl launch "$phone" dev.indigo.demo
+done
+open -a Simulator 2>/dev/null || {
+  open /Applications/Xcode.app/Contents/Applications/DeviceHub.app
+  open -n /Applications/Xcode.app/Contents/Applications/DeviceHub.app
+}
+```
 
-To build by hand instead of `demo/start.sh`:
+The phone is named by its ID because, by name alone, Xcode looks only in the
+newest iOS runtime. The regtest network and the outside world must be running.
+</details>
 
-    demo/ios/build-rust.sh               # Rust → IndigoFFI.xcframework, Swift bindings, Xcode project
-    python3 demo/outside-world.py        # keep it running
-    open demo/ios/IndigoDemo.xcodeproj
+<details>
+<summary>Troubleshooting</summary>
 
-### Terminal
+- **A spinner that never stops, or "could not reach":** the regtest network or
+  the outside world is down. Run `demo/start.sh`.
+- **Face ID prompt for the recovery phrase:** Simulator menu → Features →
+  Face ID → Enrolled, then Matching Face.
+- **Start a phone over:** ⋯ → Delete this wallet, or `demo/start.sh --fresh`.
+- **Physical iPhones** are not supported yet: the app reaches the regtest
+  network on the Mac at `127.0.0.1`.
+</details>
 
-    demo/indigo-demo.sh              # press Enter between steps
-    DEMO_AUTO=1 demo/indigo-demo.sh  # straight through, about two minutes
+### Web
 
-Alice gets paid over Lightning into Cashu, moves money to Fedimint and into
-Ark, brings on-chain coins into Ark, pays a bill from Ark, hands Bob a Cashu
-token and Fedimint notes, pays Bob over Ark, and ends with the audit.
+[http://127.0.0.1:8090/wallet.html](http://127.0.0.1:8090/wallet.html): the Ark
+pocket compiled to WebAssembly, its data in IndexedDB. Create or restore a
+wallet, receive over Lightning (with a test-faucet button), show its Ark
+address, and pay invoices or Ark addresses, including the phones'. Cashu and
+Fedimint come to the browser once the journal has a browser store.
 
-The CLI behind it does everything one command at a time: `target/debug/indigo
---network regtest --help`. It needs `INDIGO_TEST_MNEMONIC` (12 words; get some
-with `indigo new-test-seed`) and `--data-dir` for the wallet folder.
-
-### Web: the Ark pocket in a browser
-
-    open http://127.0.0.1:8090/wallet.html
-
-The Ark pocket compiled to WebAssembly, with its data in IndexedDB. Create or
-restore a wallet, receive over Lightning ("Pay it from outside" uses the
-faucet), show its Ark address, pay an invoice or an Ark address. It pays the
-phones and the phones pay it. Only Ark runs in the browser so far; Cashu and
-Fedimint need browser storage for the journal first.
-
-Building it needs Homebrew LLVM (`brew install llvm`), `wasm-bindgen-cli` and
+Building it needs `brew install llvm`, `wasm-bindgen-cli` and
 `rustup target add wasm32-unknown-unknown`; the commands are at the top of
 [apps/web-ark-check/src/lib.rs](apps/web-ark-check/src/lib.rs).
 
-## Tests
+### Terminal
 
-With the regtest stack up (`demo/start.sh`, or the two infra commands below):
+```sh
+demo/indigo-demo.sh              # press Enter between steps
+DEMO_AUTO=1 demo/indigo-demo.sh  # straight through, about two minutes
+```
 
-| Script | What it proves |
+Alice is paid over Lightning into Cashu, moves money into Fedimint and Ark,
+boards on-chain coins into Ark, pays a bill, hands Bob ecash, pays Bob over
+Ark, and finishes with the audit. The `indigo` CLI behind it exposes every
+operation (`target/debug/indigo --network regtest --help`); it reads the
+recovery words from `INDIGO_TEST_MNEMONIC` (`indigo new-test-seed` makes some).
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph apps [Apps]
+        ios["iOS · Swift"]
+        android["Android · Kotlin"]
+        cli["CLI · Rust"]
+        web["Browser · WebAssembly"]
+    end
+
+    ffi["indigo-ffi<br/>UniFFI bindings"]
+
+    subgraph core [indigo-core · the Wallet]
+        router["router<br/>which pocket pays"]
+        engine["engine<br/>crash-safe moves"]
+        store["store<br/>SQLite journal"]
+        keys["keys<br/>12-word seed"]
+    end
+
+    rail{{"Rail trait"}}
+
+    subgraph pockets [Pockets]
+        cashu["rail-cashu<br/>CDK"]
+        fedimint["rail-fedimint<br/>fedimint-sdk"]
+        bark["rail-ark-bark<br/>Bark · BDK"]
+        arkade["rail-ark-arkade<br/>ark-client"]
+    end
+
+    ios --> ffi
+    android --> ffi
+    ffi --> core
+    cli --> core
+    core --> rail
+    rail --> cashu & fedimint & bark & arkade
+    web -->|Ark pocket, for now| bark
+
+    cashu --> mint[(Cashu mint)]
+    fedimint --> federation[(Fedimint federation)]
+    bark --> barkd[(Bark server)]
+    arkade --> arkaded[(Arkade server)]
+```
+
+| Component | Responsibility |
 |---|---|
-| `tests/phase1.sh regtest` | Cashu pocket: receive, pay, ecash, kill tests |
+| **Pockets** (`crates/rail-*`) | One per Bitcoin layer, each implementing the `Rail` trait over the library that layer's own team maintains: balance, Lightning in and out, plus ecash tokens or Ark addresses, boarding and exits. |
+| **Journal** (`crates/store`) | Every operation is written to SQLite before any operator is called, and updated as it progresses. The audit compares it with each pocket's balance. |
+| **Move engine** (`crates/engine`) | Moves money between pockets over Lightning: the destination issues an invoice, the source pays it. Each step (quoted → invoice → authorized → paying → paid → claimed → completed) is saved before the next call, so a crash at any point resumes or fails cleanly on the next open. |
+| **Router** (`crates/router`) | Asks every eligible pocket for a quote and pays from the cheapest that covers the amount, planning top-ups from the others when none does. Incoming payments go to ecash below 100,000 sats and to Ark from there up. |
+| **Keys** (`crates/keys`) | One BIP39 seed backs every pocket today, provided by the platform (the iOS app stores it in the Keychain). Per-pocket BIP85 keys and SDK-managed key storage are next. |
+| **Bindings** (`crates/ffi`) | Swift and Kotlin via UniFFI, each call on the SDK's own async runtime. The browser build (`apps/web-ark-check`) compiles the Ark pocket to WebAssembly. |
+
+A payment that no single pocket can cover:
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Router
+    participant Cashu as Cashu pocket
+    participant Ark as Ark pocket
+    participant Journal
+
+    App->>Router: send(Ark address, 2,000 sats)
+    Router->>Ark: quote
+    Note over Router: Ark holds too little
+    Router->>Journal: record move Cashu → Ark
+    Ark-->>Cashu: Lightning invoice
+    Cashu->>Ark: pay it
+    Router->>Journal: move completed
+    Router->>Ark: pay the address
+    Ark-->>App: paid, with the top-up listed
+```
+
+**Restore.** From the 12 words alone, Cashu asks the mint for its ecash
+(NUT-13), Fedimint rescans the federation and Ark asks its server. What comes
+back is recorded in the journal, so the audit matches immediately.
+
+## Testing
+
+With the regtest network running:
+
+| Command | Covers |
+|---|---|
+| `cargo test --workspace` | Unit tests |
+| `tests/phase1.sh regtest` | Cashu pocket, including killing the process mid-operation |
 | `tests/phase2.sh regtest` | Fedimint pocket and moves between pockets, killed at every step |
 | `tests/phase3.sh regtest` | Ark pocket: boarding, Ark payments, Lightning in and out |
-| `tests/phase4-route.sh regtest` | Automatic pocket choice, top-ups, refusals |
-| `tests/restore.sh regtest` | Wipe a funded wallet, restore it from 12 words |
+| `tests/phase4-route.sh regtest` | Automatic pocket choice, top-ups and refusals |
+| `tests/restore.sh regtest` | Wiping a funded wallet and restoring it from 12 words |
 | `tests/web-regtest.sh` | The browser wallet in headless Chrome (needs Node and Chrome) |
-| `tests/ios-ui.sh` | Taps through the iOS app on two Simulators of its own |
+| `tests/ios-ui.sh` | The iOS app driven by taps on two dedicated Simulators |
 
-`cargo test --workspace` runs the unit tests. CI (`.github/workflows/ci.yml`)
-runs the unit tests, the regtest scripts above, and the iOS and Android builds.
+CI (`.github/workflows/ci.yml`) runs the unit tests, the regtest scripts and
+the iOS and Android builds.
 
-Stack by hand:
+## Networks
 
-    docker compose -f infra/docker-compose.regtest.yml up -d --wait
-    infra/regtest-setup.sh
-
-## Other networks
-
-The CLI also runs on **Mutinynet** (`--network mutinynet`, the default), a
-public signet with 30-second blocks, against our own mint and federation
-(`infra/mutinynet-setup.sh` and `infra/docker-compose.mutinynet.yml`) and the
-public Arkade server. It also runs on **Second's public signet**
-(`--network signet`), where only the Ark (Bark) server runs.
-`tests/phase1.sh mutinynet` and `tests/phase2.sh mutinynet` cover Mutinynet.
-
-## Layout
-
-| Path | What it is |
+| Network | What runs |
 |---|---|
-| `crates/domain` | Amounts, operations, moves, errors: the shared vocabulary |
-| `crates/rail` | The `Rail` trait every pocket implements |
-| `crates/rail-cashu` | Cashu pocket (CDK) |
-| `crates/rail-fedimint` | Fedimint pocket (fedimint-sdk) |
-| `crates/rail-ark-bark` | Ark pocket on Bark; also builds for the browser |
-| `crates/rail-ark-arkade` | Ark pocket on Arkade |
-| `crates/keys` | One 12-word seed, a separate key per pocket |
-| `crates/store` | SQLite journal of every operation and move |
-| `crates/engine` | Crash-safe moves between pockets |
-| `crates/router` | Picks the paying pocket, plans top-ups |
-| `crates/core` | The `Wallet`: send, receive, move, restore, audit |
-| `crates/ffi` | Swift and Kotlin bindings (UniFFI) |
-| `crates/testnets` | Endpoints of every test network |
-| `apps/cli` | The `indigo` CLI |
-| `apps/web-ark-check` | The browser build and the web wallet page |
-| `demo/` | `start.sh`, the pitch, the terminal demo, the iOS app, the outside world |
-| `infra/` | Docker stacks for regtest and Mutinynet, and their setup |
-| `tests/` | End-to-end scripts |
+| **Regtest** (local) | Everything: all pockets, on iOS, the web and the CLI. Used by the demos and tests. |
+| **Mutinynet** (public signet) | The CLI with Cashu and Fedimint (`infra/mutinynet-setup.sh`) and Ark via the public Arkade server. Covered by `tests/phase1.sh mutinynet` and `tests/phase2.sh mutinynet`. |
+| **Second's signet** (public) | The Ark pocket (Bark), natively and in the browser. |
+
+## Repository layout
+
+```
+crates/
+  domain          amounts, operations, moves and errors
+  rail            the Rail trait every pocket implements
+  rail-cashu      Cashu pocket (CDK)
+  rail-fedimint   Fedimint pocket (fedimint-sdk)
+  rail-ark-bark   Ark pocket on Bark; also builds for the browser
+  rail-ark-arkade Ark pocket on Arkade
+  keys            the recovery seed
+  store           SQLite journal
+  engine          crash-safe moves between pockets
+  router          pocket choice and top-up planning
+  core            the Wallet: send, receive, move, restore, audit
+  ffi             Swift and Kotlin bindings
+  testnets        endpoints of every test network
+apps/
+  cli             the indigo CLI
+  web-ark-check   the browser build and web wallet
+demo/             start/stop scripts, the pitch, the terminal demo, the iOS app
+infra/            Docker stacks for regtest and Mutinynet, and their setup
+tests/            end-to-end test scripts
+```
+
+## License
+
+MIT or Apache-2.0, at your option, as declared in `Cargo.toml`.

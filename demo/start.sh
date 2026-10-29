@@ -11,7 +11,7 @@ cd "$ROOT"
 RUN="$ROOT/demo/.run" # logs, git-ignored
 mkdir -p "$RUN"
 ALICE_PHONE="iPhone 16"
-BOB_PHONE="iPhone 16 Pro"
+BOB_PHONE="iPhone 18 Pro"
 APP=dev.indigo.demo
 
 step() { printf '\n\e[1;36m▸ %s\e[0m\n' "$*"; }
@@ -72,8 +72,15 @@ for d in "$ALICE" "$BOB"; do
   xcrun simctl install "$d" "$BUILT"
   xcrun simctl launch "$d" "$APP" >/dev/null
 done
-open -a Simulator 2>/dev/null || open /Applications/Xcode.app/Contents/Applications/DeviceHub.app
-ok "running on both phones"
+# One window per phone, side by side. Xcode 27 renamed Simulator to DeviceHub,
+# which shows one phone per window: open a second window, then pick Bob's phone in it.
+if [ -d /Applications/Xcode.app/Contents/Applications/DeviceHub.app ]; then
+  pgrep -qf DeviceHub.app || open /Applications/Xcode.app/Contents/Applications/DeviceHub.app
+  [ "$(pgrep -f DeviceHub.app | wc -l)" -ge 2 ] || open -n /Applications/Xcode.app/Contents/Applications/DeviceHub.app
+else
+  open -a Simulator
+fi
+ok "running on both phones (in DeviceHub, pick $BOB_PHONE in the second window)"
 
 printf '\n\e[1;32mReady.\e[0m Pitch script: demo/PITCH.md · terminal demo: demo/indigo-demo.sh\n'
 printf 'Web wallet: http://127.0.0.1:8090/wallet.html\n'
