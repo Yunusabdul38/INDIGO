@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Test 0.1 / 0.2 and, from Phase 1 on, every automated test.
+  workspace:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
+
+  # Test 0.6: the regtest stack comes up and the CLI sees every service.
+  regtest:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: docker compose -f infra/docker-compose.regtest.yml up -d --wait
+      - run: infra/regtest-setup.sh
+      - run: cargo build --locked -p indigo
+      # Esplora has no healthcheck (no tools in its image) and may still be
+      # indexing, so give the stack up to two minutes to settle.
+      - run: |
+          for _ in $(seq 24); do
+            ./target/debug/indigo --network regtest status && exit 0
+            sleep 5
+          done
+          exit 1
+      # Phase 1: tests 1.1-1.10 against the regtest mint, including kill tests.
+      - run: tests/phase1.sh regtest
+      # Phase 2: tests 2.1-2.11 (Fedimint pocket, moves, kill at every state),
+      # then 50 random moves with random kills.
+      - run: tests/phase2.sh regtest
+      - run: tests/phase2-soak.sh regtest 50
+      - if: failure()
+        run: docker compose -f infra/docker-compose.regtest.yml logs --tail 200
+      - if: always()
+        run: docker compose -f infra/docker-compose.regtest.yml down -v
+
+  # Test 0.3: iOS device and simulator.
+  ios:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked -p indigo-ffi --lib --profile mobile --target aarch64-apple-ios
+      - run: cargo build --locked -p indigo-ffi --lib --profile mobile --target aarch64-apple-ios-sim
+      - run: ls -l target/*/mobile/libindigo_ffi.*
+
+  # Test 0.4: Android arm64 and x86_64 (emulator).
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-ndk --locked
+      - run: cargo ndk -t arm64-v8a -t x86_64 -P 26 build --locked -p indigo-ffi --lib --profile mobile
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+      - run: ls -l target/*/mobile/libindigo_ffi.*
