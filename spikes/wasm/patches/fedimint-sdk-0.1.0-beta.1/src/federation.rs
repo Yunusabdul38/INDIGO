@@ -1,0 +1,2811 @@
+//! A joined federation, and the capability facades hanging off it.
+
+use std::future::Future;
+use std::sync::{Arc, Weak};
+
+use fedimint_client::{Client, ClientHandleArc};
+use fedimint_core::config;
+use fedimint_core::db::Database;
+use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
+use fedimint_core::module::AmountUnit;
+use fedimint_core::task::MaybeSend;
+use fedimint_core::util::FmtCompact as _;
+use futures::StreamExt;
+
+use crate::db::{FederationRecord, StoredStatus};
+use crate::operation::{Driver, Operation, OperationInner, OperationState, kinds};
+use crate::sdk::SdkInner;
+use crate::{
+    ActivityPage, Amount, AnyOperation, Cursor, Ecash, FederationId, FederationInfo,
+    FederationStatus, InviteCode, Lightning, Meta, Network, Onchain, OperationId, RecoveryProgress,
+    Result,
+};
+
+/// A handle to one federation this SDK instance has joined.
+///
+/// Everything an application does with a federation goes through this type:
+/// reading its identity and balance, obtaining the [ecash](Federation::ecash),
+/// [lightning](Federation::lightning) and [on-chain](Federation::onchain)
+/// facades, reading [metadata](Federation::meta), reattaching to a running
+/// [operation](Federation::operation), and paging through local
+/// [activity](Federation::activity).
+///
+/// Like the other handles in this crate it is a cheap clone over shared
+/// state: every clone talks to the same running federation client, and it
+/// is `Send + Sync` on native targets, with the same types compiled for a
+/// single-threaded host on wasm.
+///
+/// A handle keeps working until the federation is closed with
+/// [`Sdk::close_federation`](crate::Sdk::close_federation), erased with
+/// [`Sdk::forget_federation`](crate::Sdk::forget_federation), or the whole
+/// instance is shut down. An application holding a stale handle degrades
+/// into a reportable error rather than a crash: nothing here panics after a
+/// close.
+///
+/// # What a closed handle does
+///
+/// "Fails with
+/// [`FederationClosed`](crate::ErrorCode::FederationClosed)" applies to the
+/// **fallible** calls: [`balance`](Federation::balance),
+/// [`operation`](Federation::operation),
+/// [`activity`](Federation::activity), and every call made through a
+/// facade. The rest of this type returns plain
+/// values and has no way to report a failure, so each has a defined closed
+/// behaviour instead:
+///
+/// - **The descriptive accessors keep answering.**
+///   [`id`](Federation::id), [`name`](Federation::name),
+///   [`network`](Federation::network),
+///   [`invite_code`](Federation::invite_code) and
+///   [`capabilities`](Federation::capabilities) go on returning the
+///   configuration last known for this federation. A history screen can
+///   still label rows with a federation that has been closed underneath it.
+/// - **The facade accessors keep returning `Some`.**
+///   [`ecash`](Federation::ecash), [`lightning`](Federation::lightning) and
+///   [`onchain`](Federation::onchain) return a facade whenever the
+///   federation had that module, closed or not, and the failure surfaces
+///   from the facade call as
+///   [`FederationClosed`](crate::ErrorCode::FederationClosed). Returning
+///   `None` instead would be a lie with a specific documented meaning:
+///   "this federation has no mint module", and would make a closed
+///   federation indistinguishable from one that never supported ecash at
+///   all. [`meta`](Federation::meta), which is unconditional, behaves the
+///   same way.
+/// - **[`balance_updates`](Federation::balance_updates) still hands out a
+///   subscriber**, whose very first
+///   [`next`](BalanceUpdates::next) yields
+///   [`FederationClosed`](crate::ErrorCode::FederationClosed). The error is
+///   where a caller can act on it, rather than being swallowed by an
+///   accessor that cannot return one.
+#[derive(Debug, Clone)]
+// Crosses a UniFFI boundary as an opaque object: [`Sdk::join`] hands the binding
+// an `Arc<Federation>` handle. None of its methods are exported yet, so the
+// binding can hold the handle but not call it — the facades land in a later
+// stage. Behind the `uniffi` feature.
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+pub struct Federation {
+    inner: Arc<FederationInner>,
+}
+
+// Every method on `Federation` is exported under its real name: this block
+// and the `meta`/`activity` one below directly, and
+// `ecash`/`lightning`/`onchain`/`operation` through the renamed adapters in
+// `ffi/federation.rs`.
+// `async_runtime = "tokio"` applies to whichever methods are `async` and is
+// simply unused by the synchronous ones, exactly as `Sdk`'s own exported
+// block already mixes `export_mnemonic` (sync) with `preview`/`join` (async).
+// `new`, below all of this, stays in its own unexported block since it is
+// `pub(crate)`.
+#[cfg_attr(
+    all(feature = "uniffi", not(target_family = "wasm")),
+    uniffi::export(async_runtime = "tokio")
+)]
+#[cfg_attr(all(feature = "uniffi", target_family = "wasm"), uniffi::export)]
+impl Federation {
+    /// This federation's id.
+    pub fn id(&self) -> FederationId {
+        FederationId::from_upstream(self.inner.id)
+    }
+
+    /// The federation's human-readable name, when its configuration
+    /// declares one.
+    ///
+    /// This is configuration metadata, not a verified or unique identifier:
+    /// two federations may present the same name. Identity is
+    /// [`Federation::id`].
+    pub fn name(&self) -> Option<String> {
+        self.inner.record().name
+    }
+
+    /// The Bitcoin network this federation operates on.
+    ///
+    /// On-chain addresses are validated against this when an on-chain quote
+    /// is requested, failing with
+    /// [`NetworkMismatch`](crate::ErrorCode::NetworkMismatch) on
+    /// disagreement. There is no second check at send time, because
+    /// [`Onchain::send`](crate::Onchain::send) takes only a quote: the
+    /// address is bound into the quote when it is issued.
+    pub fn network(&self) -> Network {
+        self.inner.record().network.into()
+    }
+
+    /// An invite code for this federation, suitable for sharing so someone
+    /// else can join it.
+    pub fn invite_code(&self) -> InviteCode {
+        InviteCode::from_upstream(self.inner.record().invite)
+    }
+
+    /// The ecash balance: the value this instance currently holds as its
+    /// own, uncommitted notes.
+    ///
+    /// Value that is committed to an in-flight operation, funding a
+    /// lightning payment, sitting in out-of-band notes that have not been
+    /// redeemed or reclaimed, arriving in an on-chain deposit that is still
+    /// being claimed, is not counted here.
+    ///
+    /// Holding is not spending, and this method takes no position on the
+    /// latter: whether a spend would be *permitted* is governed by the
+    /// federation's status, not by this number. The case where the two
+    /// diverge is a recovery-locked federation: while the rescan proceeds
+    /// the balance reported here is partial, still moving, and worth
+    /// showing as progress, yet none of it is spendable, and every spend
+    /// or receive is refused with
+    /// [`Recovering`](crate::ErrorCode::Recovering) no matter what this
+    /// method returned. Once the recovery reaches
+    /// [`RecoveryState::Done`](crate::RecoveryState::Done) this holds all the
+    /// ecash the rescan found, and the two notions coincide again: this is
+    /// exactly the amount a spend can draw on.
+    ///
+    /// # Errors
+    ///
+    /// [`Internal`](crate::ErrorCode::Internal) for a client with no usable balance source
+    /// (API-version negotiation left every module out, most often), which is not the caller's
+    /// doing and not a storage fault, and
+    /// [`FederationClosed`](crate::ErrorCode::FederationClosed).
+    pub async fn balance(&self) -> Result<Amount> {
+        self.inner.balance().await
+    }
+
+    /// Opens a new, independent subscription to the balance.
+    ///
+    /// Each call returns its own cursor, exactly like
+    /// [`Operation::updates`](crate::Operation::updates): two subscribers
+    /// both see every change and neither consumes the other's updates.
+    ///
+    /// This cannot fail, so it hands out a subscriber even for a closed
+    /// federation; that subscriber's first
+    /// [`next`](BalanceUpdates::next) yields
+    /// [`FederationClosed`](crate::ErrorCode::FederationClosed).
+    pub fn balance_updates(&self) -> BalanceUpdates {
+        BalanceUpdates {
+            inner: Arc::new(BalanceUpdatesInner {
+                federation: self.inner.clone(),
+                cursor: tokio::sync::Mutex::new(BalanceCursor {
+                    stream: None,
+                    recovery_changed: None,
+                    last: None,
+                }),
+            }),
+        }
+    }
+
+    /// What this federation can do.
+    ///
+    /// Reported as plain booleans so an application can decide what to
+    /// render before the user touches anything. It answers the same
+    /// question as the three facade accessors below and exists alongside
+    /// them for the case where a screen needs to know about several
+    /// capabilities at once without taking handles it will not use.
+    pub fn capabilities(&self) -> Capabilities {
+        self.inner.record().capabilities.into()
+    }
+}
+
+// `ecash`, `lightning`, `onchain` and `operation` below keep their
+// plain-Rust shape (an object nested in `Option`/`Result<Option<_>>`,
+// never `Arc`) rather than paying that cost in the API every caller reads,
+// native and wasm included, for a constraint that is only ever UniFFI's:
+// see the renamed, Arc-wrapping adapters in `ffi/federation.rs`.
+impl Federation {
+    /// The ecash facade, or `None` if this federation has no mint module.
+    ///
+    /// `None` means exactly one thing: this federation has no mint module. It does not mean
+    /// "closed": a closed federation that has a mint module still returns `Some`, and the
+    /// facade's calls fail with
+    /// [`FederationClosed`](crate::ErrorCode::FederationClosed). See the type documentation.
+    ///
+    /// [`ErrorCode::NotSupported`](crate::ErrorCode::NotSupported) covers the narrower case of
+    /// a facade obtained while the module was present, then used after the federation's
+    /// configuration changed to drop it.
+    pub fn ecash(&self) -> Option<Ecash> {
+        self.capabilities()
+            .ecash
+            .then(|| Ecash::new(self.inner.clone()))
+    }
+
+    /// The lightning facade, or `None` if the federation has no lightning
+    /// module. See [`Federation::ecash`] for why this is an `Option`.
+    pub fn lightning(&self) -> Option<Lightning> {
+        self.capabilities()
+            .lightning
+            .then(|| Lightning::new(self.inner.clone()))
+    }
+
+    /// The on-chain facade, or `None` if this federation has no wallet
+    /// module. See [`Federation::ecash`] for why this is an `Option`.
+    pub fn onchain(&self) -> Option<Onchain> {
+        self.capabilities()
+            .onchain
+            .then(|| Onchain::new(self.inner.clone()))
+    }
+
+    /// Looks up an operation by id, whatever kind it is.
+    ///
+    /// This is how an application reattaches after a restart: persist the
+    /// [`OperationId`] (or read one from
+    /// [`ActivityItem`](crate::ActivityItem)), pass it here, and get back a
+    /// handle to the operation that has been running all along.
+    ///
+    /// The call is asynchronous and fallible because it reads persistent
+    /// state: the operation log lives in storage, not in memory, and a
+    /// lookup can fail the way any read can.
+    ///
+    /// `Ok(None)` means precisely that this federation has no operation
+    /// with that id. It is not an error: asking about an id that turns out
+    /// not to exist (a stale deep link, a record from a federation that was
+    /// forgotten) is a normal thing for an application to do.
+    ///
+    /// An operation that exists but that this SDK version cannot interpret
+    /// comes back as `Ok(Some(op))` with
+    /// [`OperationKind::Unknown`](crate::OperationKind::Unknown) rather than
+    /// as an error. Persisted operations outlive any one SDK version:
+    /// applications get downgraded, module sets change, and a record
+    /// written by a newer build is still a real record. Reporting it as
+    /// unknown lets a history screen show it honestly; failing the lookup
+    /// would make it invisible.
+    ///
+    /// # Errors
+    ///
+    /// [`Storage`](crate::ErrorCode::Storage) if the operation log cannot
+    /// be read, [`FederationClosed`](crate::ErrorCode::FederationClosed) if
+    /// the federation is closed.
+    pub async fn operation(&self, id: &OperationId) -> Result<Option<AnyOperation>> {
+        self.inner.ensure_open()?;
+        self.inner.operation(id.upstream()).await
+    }
+}
+
+#[cfg_attr(
+    all(feature = "uniffi", not(target_family = "wasm")),
+    uniffi::export(async_runtime = "tokio")
+)]
+#[cfg_attr(all(feature = "uniffi", target_family = "wasm"), uniffi::export)]
+impl Federation {
+    /// The metadata facade.
+    ///
+    /// Unconditional, unlike the three capability facades above: every
+    /// federation has configuration metadata, so there is always something
+    /// to read. A federation without a meta module simply has no consensus
+    /// metadata, which [`Meta`] reports as an absent value rather than as a
+    /// missing facade.
+    pub fn meta(&self) -> Meta {
+        Meta::new(self.inner.clone())
+    }
+
+    /// Reads a page of local activity history, newest first.
+    ///
+    /// Pass `None` as `cursor` for the first page and the
+    /// [`next`](crate::ActivityPage::next) cursor of the previous page for
+    /// each following one. At most `limit` items are returned; fewer is
+    /// normal, and an empty page with no cursor means the end.
+    ///
+    /// Rows still in flight are brought up to date before the page is
+    /// returned, so a page that has any takes a moment longer than one
+    /// that has none.
+    ///
+    /// The history is *local*, see [`ActivityItem`](crate::ActivityItem)
+    /// for exactly what that excludes.
+    ///
+    /// # Errors
+    ///
+    /// [`Storage`](crate::ErrorCode::Storage),
+    /// [`InvalidInput`](crate::ErrorCode::InvalidInput) for a cursor that
+    /// is not one this federation issued or for a `limit` of zero, and
+    /// [`FederationClosed`](crate::ErrorCode::FederationClosed).
+    pub async fn activity(&self, cursor: Option<Cursor>, limit: u16) -> Result<ActivityPage> {
+        crate::activity::page(&self.inner, cursor, limit).await
+    }
+}
+
+impl Federation {
+    /// Wraps shared federation state in a handle.
+    pub(crate) fn new(inner: Arc<FederationInner>) -> Federation {
+        Federation { inner }
+    }
+}
+
+/// Which capabilities a federation offers.
+///
+/// Each flag says whether the corresponding accessor on [`Federation`]
+/// would return `Some`. Reading them is how an application decides what to
+/// put on screen before the user acts, rather than discovering an absent
+/// capability by attempting an operation and handling the failure.
+///
+/// `#[non_exhaustive]` like every data type here: a federation gaining a
+/// new kind of capability must be an additive change, not a breaking one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// A plain record of three bools: every field is FFI-safe as-is. Behind the
+// `uniffi` feature.
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+#[non_exhaustive]
+pub struct Capabilities {
+    /// Whether [`Federation::ecash`] is available.
+    pub ecash: bool,
+    /// Whether [`Federation::lightning`] is available.
+    pub lightning: bool,
+    /// Whether [`Federation::onchain`] is available.
+    pub onchain: bool,
+}
+
+/// One independent subscription to a federation's balance.
+///
+/// Obtained from [`Federation::balance_updates`]. Not `Clone`, for the same
+/// reason [`OperationUpdates`](crate::OperationUpdates) is not: it is a
+/// single cursor, and a second consumer should have a second subscription.
+/// Dropping it stops only this subscription.
+#[derive(Debug)]
+// Crosses a UniFFI boundary as an opaque object directly: `next`'s real
+// mutation all happens through `self.inner.cursor`, already a `tokio::sync
+// ::Mutex` reached through the shared `Arc<BalanceUpdatesInner>` above, so
+// `&mut self` on `next` is a plain-Rust API discipline ("one subscriber, one
+// cursor"), not a genuine requirement of the implementation — the
+// `#[uniffi::export]` block in `ffi/federation.rs` calls the same body
+// through `&self` instead of wrapping this type in another lock.
+#[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+pub struct BalanceUpdates {
+    inner: Arc<BalanceUpdatesInner>,
+}
+
+impl BalanceUpdates {
+    /// Waits for the next balance.
+    ///
+    /// The first call returns the current balance immediately; each later
+    /// call resolves when the balance changes.
+    ///
+    /// Unlike [`OperationUpdates::next`](crate::OperationUpdates::next), this never resolves
+    /// to a clean end: a balance has no final state, so the only way this stream ends is the
+    /// federation being closed or the SDK shutting down, reported as an error rather than
+    /// folded into an `Option`.
+    ///
+    /// # Errors
+    ///
+    /// [`FederationClosed`](crate::ErrorCode::FederationClosed) once the
+    /// federation is closed or the SDK shut down, the terminal condition
+    /// for this stream. Other errors are infrastructure failures:
+    /// [`Storage`](crate::ErrorCode::Storage) or
+    /// [`Internal`](crate::ErrorCode::Internal).
+    pub async fn next(&mut self) -> Result<Amount> {
+        self.next_shared().await
+    }
+
+    /// The body of [`BalanceUpdates::next`], taking `&self`: every field it
+    /// touches is already behind `self.inner.cursor`'s own lock, so the
+    /// UniFFI-facing `next` (which can only ever hold a shared
+    /// `Arc<BalanceUpdates>`, never an exclusive one) can call it too.
+    pub(crate) async fn next_shared(&self) -> Result<Amount> {
+        let mut cursor = self.inner.cursor.lock().await;
+        let mut closed = self.inner.federation.closed();
+        loop {
+            if *closed.borrow_and_update() {
+                return Err(crate::Error::new(
+                    crate::ErrorCode::FederationClosed,
+                    "this federation is not running",
+                ));
+            }
+
+            if cursor.stream.is_none() {
+                // Taken before the read below, so a recovery that ends between the read and the
+                // wait on it is not missed. It outlives the stream established here for the same
+                // reason: a recovery's swap retires the client that stream reads from.
+                let mut recovery_changed = self.inner.federation.recovery_changed();
+                let client = self.inner.federation.client(false).await?;
+                // Upstream's balance stream never yields and never ends when a client has no
+                // primary module, so a read has to prove there is one before a caller is handed
+                // something that could hang for the life of the process.
+                match client.get_balance_for_unit(AmountUnit::BITCOIN).await {
+                    Ok(_) => {}
+                    // No balance source yet because a v1 mint is still recovering (see
+                    // `Federation::balance`): the provisional figure is zero, handed out once,
+                    // and the next change is the recovery ending and swapping a usable client in.
+                    Err(_) if self.inner.federation.status() == FederationStatus::Recovering => {
+                        drop(client);
+                        let zero = Amount::from_msats(0);
+                        if cursor.last != Some(zero) {
+                            cursor.last = Some(zero);
+                            return Ok(zero);
+                        }
+                        tokio::select! {
+                            _ = recovery_changed.changed() => {}
+                            _ = closed.changed() => {}
+                        }
+                        continue;
+                    }
+                    Err(err) => {
+                        return Err(crate::Error::new(
+                            crate::ErrorCode::Internal,
+                            format!(
+                                "this federation cannot report a balance: {}",
+                                err.fmt_compact()
+                            ),
+                        ));
+                    }
+                }
+                cursor.stream = Some(client.subscribe_balance_changes(AmountUnit::BITCOIN).await);
+                cursor.recovery_changed = Some(recovery_changed);
+            }
+
+            let cursor = &mut *cursor;
+            let stream = cursor
+                .stream
+                .as_mut()
+                .expect("the stream was just established");
+            let recovery_changed = cursor
+                .recovery_changed
+                .as_mut()
+                .expect("taken with the stream");
+            let next = tokio::select! {
+                next = stream.next() => next,
+                _ = closed.changed() => continue,
+                // A recovery ending swaps the client, and with it the module this stream reads
+                // from: a stream over the retired client never yields again.
+                _ = recovery_changed.changed() => {
+                    cursor.stream = None;
+                    continue;
+                }
+            };
+            let Some(balance) = next else {
+                // The stream only ends when the client behind it is gone: with the federation
+                // still running, that is a swap, and the successor is subscribed to instead.
+                if !*closed.borrow() {
+                    cursor.stream = None;
+                    continue;
+                }
+                return Err(crate::Error::new(
+                    crate::ErrorCode::FederationClosed,
+                    "this federation is not running",
+                ));
+            };
+
+            let balance = Amount::from_msats(balance.msats);
+            if cursor.last == Some(balance) {
+                continue;
+            }
+            cursor.last = Some(balance);
+            return Ok(balance);
+        }
+    }
+}
+
+/// The shared per-federation state every [`Federation`] clone and every facade talks to.
+///
+/// The optional client is the whole lifecycle in one field: `None` is a federation that is closed,
+/// quarantined, or on its way out, and taking the write lock is how a close, an erase or a
+/// shutdown waits for the calls already in flight before it takes the client away.
+#[derive(Debug)]
+pub(crate) struct FederationInner {
+    pub(crate) id: config::FederationId,
+    /// The instance this federation belongs to. Weak, because the instance owns the federations.
+    pub(crate) sdk: Weak<SdkInner>,
+    /// This federation's slice of the root store, which is also what the client was given.
+    pub(crate) db: Database,
+    /// `None` while the federation is not running, for any reason.
+    client: tokio::sync::RwLock<Option<ClientHandleArc>>,
+    /// The last configuration that validated, which is what the descriptive accessors answer from.
+    record: std::sync::RwLock<FederationRecord>,
+    /// The configuration metadata, kept updated alongside the record.
+    config_meta: std::sync::RwLock<std::collections::BTreeMap<String, String>>,
+    /// The observable status, which is richer than the stored one: quarantine and recovery are
+    /// facts about a running instance rather than about the storage.
+    status: std::sync::RwLock<FederationStatus>,
+    /// Flipped once the federation stops running, so a pending subscriber resolves promptly
+    /// instead of waiting on a stream that will never yield again.
+    closed: tokio::sync::watch::Sender<bool>,
+    /// Bumped whenever a recovery attempt's recorded state changes, so a subscriber to the
+    /// attempt wakes up without polling.
+    recovery_changed: tokio::sync::watch::Sender<u64>,
+    /// The current attempt's aggregate recovery progress, alongside the attempt it belongs to,
+    /// so a subscriber to an older attempt never reads another attempt's numbers.
+    recovery_progress:
+        tokio::sync::watch::Sender<Option<(fedimint_core::core::OperationId, RecoveryProgress)>>,
+    /// Which client instance a recovery settle is watching, if one is; see
+    /// [`FederationInner::try_start_settle`].
+    settle: std::sync::Mutex<SettleMarker>,
+    /// Serialises the start of a lightning claim retry per federation: the read of the record,
+    /// the upstream call that starts the retry and the write that records it happen under this
+    /// lock, so two subscribers that see the same rejected claim start exactly one retry.
+    reclaim_starts: tokio::sync::Mutex<()>,
+    /// Serialises rebuilding a record from the client's log while this federation runs: the
+    /// check that no record already answers for a walletv2 deposit and the write of the record
+    /// for it happen under this lock, so two lookups on it racing over two claims of one deposit
+    /// can never both record it. A federation opened in this one's place has a lock of its own.
+    deposit_records: tokio::sync::Mutex<()>,
+}
+
+/// Which client instance, of however many a `FederationInner` sees installed over its life, a
+/// recovery settle is currently watching.
+///
+/// `current` is bumped every time a new client replaces whatever was installed before it, so it
+/// names the client presently in place. `running`, when it is set, names the client identity a
+/// settle claimed with [`FederationInner::try_start_settle`]. Comparing the two tells a settle
+/// running for the client in place from one left over from a predecessor. A plain flag could not:
+/// it would either let a client be swapped a second time while its settle is still watching it,
+/// or refuse to settle a fresh client because an old settle, from before a close and reopen, has
+/// not cleared its claim yet.
+#[derive(Debug, Default, Clone, Copy)]
+struct SettleMarker {
+    current: u64,
+    running: Option<u64>,
+}
+
+/// Whether a record is the placeholder `FederationInner::backfill_at`'s no-backfiller branch
+/// writes: the module kind copied verbatim as the tag.
+///
+/// No facade ever writes this shape — every real kind tag lives in `crate::operation::kinds` and
+/// names the operation rather than the module that owns it — so a record with it is always safe
+/// for reconciliation to replace. A tag this build simply does not recognise is not the same
+/// thing: it may be a newer build's real kind, carrying a cancellation intent, a phase or a final
+/// state this build cannot reconstruct from the log entry alone.
+fn is_unclaimed_placeholder(record: &crate::db::OperationRecord) -> bool {
+    record.kind == record.module
+}
+
+impl FederationInner {
+    /// Assembles the shared state for one federation.
+    ///
+    /// `client` is `None` for a federation the instance remembers but is not running.
+    pub(crate) fn new(
+        id: config::FederationId,
+        sdk: Weak<SdkInner>,
+        db: Database,
+        record: FederationRecord,
+        config_meta: std::collections::BTreeMap<String, String>,
+        status: FederationStatus,
+        client: Option<ClientHandleArc>,
+    ) -> FederationInner {
+        let running = client.is_some();
+        FederationInner {
+            id,
+            sdk,
+            db,
+            client: tokio::sync::RwLock::new(client),
+            record: std::sync::RwLock::new(record),
+            config_meta: std::sync::RwLock::new(config_meta),
+            status: std::sync::RwLock::new(status),
+            closed: tokio::sync::watch::Sender::new(!running),
+            recovery_changed: tokio::sync::watch::Sender::new(0),
+            recovery_progress: tokio::sync::watch::Sender::new(None),
+            settle: std::sync::Mutex::new(SettleMarker::default()),
+            reclaim_starts: tokio::sync::Mutex::new(()),
+            deposit_records: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// A read guard over the live client, or the reason there is not one.
+    ///
+    /// Every facade call holds one of these for its whole duration, which is what makes a close or
+    /// an erase wait for work already in flight rather than pulling the client out from under it.
+    /// `fund_touching` marks the calls a recovery-locked federation refuses: sends and receives,
+    /// as opposed to reading a balance or a name.
+    pub(crate) async fn client(&self, fund_touching: bool) -> Result<ClientGuard<'_>> {
+        if fund_touching && self.status() == FederationStatus::Recovering {
+            return Err(crate::Error::new(
+                crate::ErrorCode::Recovering,
+                "this federation's wallet is still being reconstructed",
+            ));
+        }
+        let guard = self.client.read().await;
+        if guard.is_none() {
+            return Err(crate::Error::new(
+                crate::ErrorCode::FederationClosed,
+                "this federation is not running",
+            ));
+        }
+        Ok(ClientGuard(guard))
+    }
+
+    /// The ecash balance: the value this instance currently holds as its balance with this federation.
+    ///
+    /// Takes a client guard of its own, so a caller that is already holding one must call
+    /// [`balance_of`] instead; see that function for why.
+    pub(crate) async fn balance(&self) -> Result<Amount> {
+        let client = self.client(false).await?;
+        balance_of(&client, self.status()).await
+    }
+
+    /// Whether this federation still has an out-of-band ecash send that has not settled.
+    ///
+    /// The erase guard cannot answer this from the client alone. On the v1 mint an unredeemed
+    /// send keeps a state machine alive for as long as the refund is available, so
+    /// `get_active_operations` sees it; mintv2 has no state machine at all — its `send` takes
+    /// the notes out of the balance, writes a log entry and returns — so an outstanding mintv2
+    /// send is invisible there. A wallet that sent its whole balance out of band therefore
+    /// looks, to the client, exactly like an empty one with nothing running, and erasing it
+    /// would throw away the only copy of notes that are still reclaimable.
+    ///
+    /// Answered from the SDK's own records instead, which exist for both generations: an
+    /// `ecash_send` with no `final_state` has not been observed reaching
+    /// [`Canceled`](crate::EcashSendState::Canceled) or
+    /// [`Redeemed`](crate::EcashSendState::Redeemed).
+    ///
+    /// Deliberately refuses on "not known to have settled" rather than "known to be
+    /// reclaimable": a send whose notes the receiver has already redeemed, which nothing has
+    /// observed yet, also blocks the erase. That is the safe direction — the remedy is to
+    /// observe the operation, which settles it — and the alternative would mean guessing about
+    /// bearer notes that may still be live.
+    pub(crate) async fn has_unsettled_ecash_send(&self) -> Result<bool> {
+        use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
+        use futures::StreamExt;
+
+        let db = self.db();
+        let mut dbtx = db.begin_transaction_nc().await;
+        let mut records = dbtx
+            .find_by_prefix(&crate::db::OperationRecordKeyPrefix)
+            .await;
+        while let Some((_, record)) = records.next().await {
+            if record.kind == crate::operation::kinds::ECASH_SEND && record.final_state.is_none() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether this federation has an on-chain deposit that has not yet reached a final state.
+    ///
+    /// The erase guard's on-chain counterpart to
+    /// [`has_unsettled_ecash_send`](Self::has_unsettled_ecash_send): an `ONCHAIN_RECEIVE` record
+    /// with no final state is a claim in progress, which erasing the federation must not
+    /// abandon. The caller first runs [`pick_up_deposits`](crate::onchain::pick_up_deposits),
+    /// which records the deposits found since the last pass.
+    pub(crate) async fn has_seen_unclaimed_deposit(&self) -> Result<bool> {
+        use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
+        use futures::StreamExt;
+
+        let db = self.db();
+        let mut dbtx = db.begin_transaction_nc().await;
+        let mut records = dbtx
+            .find_by_prefix(&crate::db::OperationRecordKeyPrefix)
+            .await;
+        while let Some((_, record)) = records.next().await {
+            if record.kind == crate::operation::kinds::ONCHAIN_RECEIVE
+                && record.final_state.is_none()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// This federation's slice of the store, for records the SDK keeps beside the client's.
+    pub(crate) fn db(&self) -> Database {
+        self.db.clone()
+    }
+
+    /// A snapshot of the last configuration that validated.
+    pub(crate) fn record(&self) -> FederationRecord {
+        read_lock(&self.record).clone()
+    }
+
+    /// The federation's configuration metadata.
+    pub(crate) fn config_meta(&self) -> std::collections::BTreeMap<String, String> {
+        read_lock(&self.config_meta).clone()
+    }
+
+    /// Replaces the cached configuration metadata.
+    pub(crate) fn set_config_meta(&self, meta: std::collections::BTreeMap<String, String>) {
+        *write_lock(&self.config_meta) = meta;
+    }
+
+    /// Replaces the cached configuration snapshot. The durable write is the caller's job.
+    pub(crate) fn set_record(&self, record: FederationRecord) {
+        *write_lock(&self.record) = record;
+    }
+
+    /// What the SDK can currently do with this federation.
+    pub(crate) fn status(&self) -> FederationStatus {
+        read_lock(&self.status).clone()
+    }
+
+    /// Records a new status and, when it is not an open one, releases everything waiting on the
+    /// federation so a pending subscriber resolves instead of hanging.
+    pub(crate) fn set_status(&self, status: FederationStatus) {
+        let open = matches!(
+            status,
+            FederationStatus::Running | FederationStatus::Recovering
+        );
+        *write_lock(&self.status) = status;
+        self.closed.send_replace(!open);
+    }
+
+    /// The listing record for this federation.
+    pub(crate) fn info(&self) -> FederationInfo {
+        let record = self.record();
+        FederationInfo {
+            id: crate::FederationId::from_upstream(self.id),
+            name: record.name,
+            network: record.network.into(),
+            status: self.status(),
+        }
+    }
+
+    /// Whether this federation is one of the two open states.
+    pub(crate) fn is_open(&self) -> bool {
+        matches!(
+            self.status(),
+            FederationStatus::Running | FederationStatus::Recovering
+        )
+    }
+
+    /// Puts a freshly opened client in place. Callers set the status separately, after the
+    /// durable write that makes the transition observable.
+    pub(crate) async fn install(&self, client: ClientHandleArc) {
+        let mut guard = self.client.write().await;
+        *guard = Some(client);
+        self.bump_client_identity();
+    }
+
+    /// Retires the federation and hands back its client, if it had one.
+    ///
+    /// Taking the write lock is the quiesce: it waits for every call already holding a
+    /// [`ClientGuard`], and once it returns nothing new can take one. The client's own workers are
+    /// told to stop here so their state is flushed before eligibility for anything is judged; the
+    /// handle is still readable afterwards, which is what lets an erase check a balance.
+    pub(crate) async fn quiesce(&self) -> Option<ClientHandleArc> {
+        let taken = self.client.write().await.take();
+        self.closed.send_replace(true);
+        if let Some(client) = taken.as_ref() {
+            client.task_group().shutdown();
+        }
+        taken
+    }
+
+    /// Retires the federation and shuts its client down.
+    pub(crate) async fn stop(&self) -> Result<()> {
+        let Some(client) = self.quiesce().await else {
+            return Ok(());
+        };
+        shutdown_client(client).await
+    }
+
+    /// Swaps the live client for a freshly opened one, under the client write lock.
+    ///
+    /// The old client is taken out and shut down before `open` is even called: two clients open
+    /// over the same database at once is exactly what the single-opener claim exists to prevent,
+    /// so the old one has to be gone before the new one can be asked for. A failure shutting the
+    /// old one down is logged and does not stop the swap, because refusing to open the
+    /// replacement over a client that is already on its way out would help nobody.
+    ///
+    /// `closed` is left untouched throughout: unlike [`quiesce`](Self::quiesce), this is not the
+    /// federation shutting down, and every handle to it stays live for the duration. On `Err`
+    /// from `open`, the lock is released with no client installed, which reads exactly like any
+    /// other reason there is currently no client; the caller decides what status that leaves the
+    /// federation in.
+    ///
+    /// # Errors
+    ///
+    /// [`FederationClosed`](crate::ErrorCode::FederationClosed), without calling `open`, when no
+    /// client is in place: the federation was closed, quarantined or erased first, and a swap
+    /// must not undo that. Otherwise whatever `open` returns.
+    pub(crate) async fn replace_client<F, Fut>(&self, open: F) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<ClientHandleArc>>,
+    {
+        let mut guard = self.client.write().await;
+        // No client in place means the federation was closed, quarantined or erased while the
+        // caller was deciding to swap: opening a fresh client now would resurrect it behind
+        // the lifecycle's back, so the swap is refused and the caller leaves the status alone.
+        let Some(old) = guard.take() else {
+            return Err(crate::Error::new(
+                crate::ErrorCode::FederationClosed,
+                "this federation is closed",
+            ));
+        };
+        // Told to stop before the consuming shutdown is attempted, as `quiesce` does: a stray
+        // handle to the old client makes that shutdown fail, and without this the old client
+        // would keep running until the stray handle went.
+        old.task_group().shutdown();
+        if let Err(err) = shutdown_client(old).await {
+            tracing::warn!(
+                target: "fedimint_sdk",
+                federation = %self.id,
+                error = %err,
+                "could not cleanly shut down the client being replaced",
+            );
+        }
+        let fresh = open().await?;
+        *guard = Some(fresh);
+        self.bump_client_identity();
+        Ok(())
+    }
+
+    /// The raw read side of the client lock, for tests that need to hold it the way a facade
+    /// call does without a live client behind it.
+    #[cfg(test)]
+    pub(crate) async fn hold_client(
+        &self,
+    ) -> tokio::sync::RwLockReadGuard<'_, Option<ClientHandleArc>> {
+        self.client.read().await
+    }
+
+    /// A receiver that fires when this federation stops running.
+    pub(crate) fn closed(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.closed.subscribe()
+    }
+
+    /// A receiver that fires whenever a recovery attempt's recorded state changes.
+    pub(crate) fn recovery_changed(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.recovery_changed.subscribe()
+    }
+
+    /// Wakes every subscriber to [`FederationInner::recovery_changed`].
+    pub(crate) fn bump_recovery(&self) {
+        self.recovery_changed.send_modify(|n| *n += 1);
+    }
+
+    /// A receiver that fires whenever the current attempt's published aggregate recovery
+    /// progress changes.
+    pub(crate) fn recovery_progress_changed(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<(fedimint_core::core::OperationId, RecoveryProgress)>>
+    {
+        self.recovery_progress.subscribe()
+    }
+
+    /// The aggregate recovery progress published for `attempt`, or `None` if this federation's
+    /// currently published progress belongs to a different attempt, or nothing has been
+    /// published yet.
+    pub(crate) fn recovery_progress_of(
+        &self,
+        attempt: fedimint_core::core::OperationId,
+    ) -> Option<RecoveryProgress> {
+        (*self.recovery_progress.borrow())
+            .and_then(|(published, progress)| (published == attempt).then_some(progress))
+    }
+
+    /// Clears whatever progress was last published. A watcher calls it when it starts, so a new
+    /// attempt never shows a predecessor's numbers, and whenever not every module has reported
+    /// yet.
+    pub(crate) fn reset_recovery_progress(&self) {
+        self.recovery_progress
+            .send_if_modified(|current| current.take().is_some());
+    }
+
+    /// Publishes `attempt`'s fresh aggregate progress, if it differs from what is already
+    /// published.
+    pub(crate) fn publish_recovery_progress(
+        &self,
+        attempt: fedimint_core::core::OperationId,
+        progress: RecoveryProgress,
+    ) {
+        self.recovery_progress.send_if_modified(|current| {
+            let next = Some((attempt, progress));
+            if *current == next {
+                false
+            } else {
+                *current = next;
+                true
+            }
+        });
+    }
+
+    /// Claims the client installed right now for a recovery settle, unless one is already
+    /// claimed for it. Returns the identity to settle for, so its conclusion can tell whether
+    /// that is still the client installed by then with
+    /// [`FederationInner::is_current_client`].
+    pub(crate) fn try_start_settle(&self) -> Option<u64> {
+        let mut settle = self.lock_settle();
+        if settle.running == Some(settle.current) {
+            None
+        } else {
+            settle.running = Some(settle.current);
+            Some(settle.current)
+        }
+    }
+
+    /// Whether a settle is already claimed for the client installed right now.
+    ///
+    /// The guard against swapping a client a second time while the first swap's own settle is
+    /// still watching it: whoever is running one owns concluding this rescan's attempt, and a
+    /// second swap would retire a client that never needed replacing again. It is false both
+    /// before a settle starts and after one has concluded; the attempt's own record tells those
+    /// two apart.
+    pub(crate) fn is_settling(&self) -> bool {
+        let settle = self.lock_settle();
+        settle.running == Some(settle.current)
+    }
+
+    /// Whether `identity` still names the client installed right now.
+    pub(crate) fn is_current_client(&self, identity: u64) -> bool {
+        self.lock_settle().current == identity
+    }
+
+    /// Releases a settle's claim on `identity`, if it is still the one claimed. Called once a
+    /// settle concludes, however it ends, so a later client on this federation can be settled
+    /// too.
+    pub(crate) fn finish_settle(&self, identity: u64) {
+        let mut settle = self.lock_settle();
+        if settle.running == Some(identity) {
+            settle.running = None;
+        }
+    }
+
+    /// The lock that serialises starting a lightning claim retry for this federation.
+    pub(crate) async fn lock_reclaim_starts(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.reclaim_starts.lock().await
+    }
+
+    /// `Ok` while this federation is still usable, and
+    /// [`FederationClosed`](crate::ErrorCode::FederationClosed) once it is not.
+    ///
+    /// Both halves of "usable" are asked. The stored row says whether the storage still means
+    /// this federation to be opened at all; the live status says whether it is running now, and
+    /// a quarantined federation is exactly the case where the two disagree, because quarantine
+    /// leaves the row untouched. Neither half reads the client handle, so the answer is the same
+    /// after a close, a quarantine and a shutdown, and does not depend on whether some other
+    /// task is holding the client lock.
+    pub(crate) fn ensure_open(&self) -> crate::Result<()> {
+        match read_lock(&self.record).status {
+            StoredStatus::Open => {}
+            // `Joining` is an interrupted join: the next build wipes that namespace and redoes
+            // the join from the invite, so nothing in it may be used in the meantime.
+            StoredStatus::Joining | StoredStatus::Closed | StoredStatus::Forgetting => {
+                return Err(crate::Error::new(
+                    crate::ErrorCode::FederationClosed,
+                    "this federation is closed",
+                ));
+            }
+        }
+        if !self.is_open() {
+            return Err(crate::Error::new(
+                crate::ErrorCode::FederationClosed,
+                "this federation is closed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records a newly created operation and returns the handle for it.
+    ///
+    /// Called by a facade immediately after the module call that created the operation returned
+    /// its id. `details` is the facade's own wire record, serialised here so that the JSON shape
+    /// of a details record is the facade's business and the storage layer's is only that it is
+    /// JSON.
+    ///
+    /// # Errors
+    ///
+    /// [`Storage`](crate::ErrorCode::Storage) if the record cannot be committed,
+    /// [`FederationClosed`](crate::ErrorCode::FederationClosed), and
+    /// [`Internal`](crate::ErrorCode::Internal) for a details record that will not serialise,
+    /// which is a bug in the facade rather than a condition an application can be in.
+    pub(crate) async fn create_operation<S>(
+        self: &Arc<Self>,
+        id: fedimint_core::core::OperationId,
+        kind: &str,
+        module: &str,
+        details: &impl serde::Serialize,
+        driver: Arc<dyn Driver<S>>,
+    ) -> crate::Result<Operation<S>>
+    where
+        S: OperationState,
+    {
+        self.ensure_open()?;
+        // Both of these are hoisted out of the transaction below on purpose: an autocommit
+        // closure may run more than once (`fedimint-core/src/db/mod.rs:542-544`), and a
+        // creation time that changed between attempts would put the record and its index entry
+        // out of step.
+        let created_at = crate::db::now_millis();
+        let details = serde_json::to_string(details).map_err(|err| {
+            crate::Error::new(
+                crate::ErrorCode::Internal,
+                format!("could not record what this operation is: {err}"),
+            )
+        })?;
+        let record = crate::db::OperationRecord {
+            schema_version: crate::operation::READABLE_STATE_SCHEMA,
+            kind: kind.to_owned(),
+            module: module.to_owned(),
+            created_at,
+            details,
+            phase: None,
+            cancel_requested_at: None,
+            final_state: None,
+        };
+        // `overwrite_placeholder: true`: reconciliation can race this very call, reading the
+        // client's own log entry for the id this call just minted before this call's own write
+        // lands, and writing a placeholder for it. That placeholder is only ever a guess, and the
+        // record built here from the caller's actual intent always outranks it, so it replaces
+        // one it finds. Anything else already won a race against this call outright — a real
+        // record cannot be a placeholder — and is kept exactly as it is.
+        let record = self.write_record(id, record, true).await?;
+        Ok(Operation::attach(
+            Arc::new(OperationInner {
+                federation: self.clone(),
+                id,
+                record,
+            }),
+            driver,
+        ))
+    }
+
+    /// Records a recovery attempt's operation, in the fixed shape every attempt is written in.
+    ///
+    /// Called before the federation's client exists, by whichever of `Sdk::recover`,
+    /// `Sdk::resume_recovery` or the pre-open repair minted this attempt, so it needs no client
+    /// and no [`ensure_open`](Self::ensure_open). An existing record for `attempt` is kept as
+    /// is: `overwrite_placeholder: false` never replaces one, and this attempt's record is never
+    /// the placeholder shape `write_record` would offer up for replacement anyway.
+    ///
+    /// # Errors
+    ///
+    /// [`Storage`](crate::ErrorCode::Storage) if the record cannot be committed.
+    pub(crate) async fn record_recovery_attempt(
+        &self,
+        attempt: fedimint_core::core::OperationId,
+    ) -> crate::Result<()> {
+        record_recovery_attempt_in(&self.db(), attempt).await
+    }
+
+    /// Looks one operation up by id, rebuilding its record from the client's own log if the log
+    /// has an entry for the id and no record answers for it yet.
+    ///
+    /// `None` when there is no such operation. A log entry that is not an operation has none
+    /// either: a deposit address a wallet module handed out, or another claim of a deposit that
+    /// already has its record.
+    ///
+    /// # Errors
+    ///
+    /// [`Storage`](crate::ErrorCode::Storage).
+    pub(crate) async fn operation(
+        self: &Arc<Self>,
+        id: fedimint_core::core::OperationId,
+    ) -> crate::Result<Option<AnyOperation>> {
+        let Some(record) = self.record_of(id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(AnyOperation::from_record(Arc::new(OperationInner {
+            federation: self.clone(),
+            id,
+            record,
+        }))))
+    }
+
+    /// One operation's record, rebuilt from the client's own log if the log has an entry for
+    /// the id and no record answers for it yet.
+    ///
+    /// # Errors
+    ///
+    /// [`Storage`](crate::ErrorCode::Storage).
+    pub(crate) async fn record_of(
+        self: &Arc<Self>,
+        id: fedimint_core::core::OperationId,
+    ) -> crate::Result<Option<crate::db::OperationRecord>> {
+        let db = self.db();
+        let mut dbtx = db.begin_transaction_nc().await;
+        let stored = dbtx.get_value(&crate::db::OperationRecordKey(id)).await;
+        drop(dbtx);
+        match stored {
+            Some(record) => Ok(Some(record)),
+            None => self.backfill(id).await,
+        }
+    }
+
+    /// Gives every operation in the client's log an SDK record, and upgrades any record this
+    /// build can now place better than the build that wrote it could.
+    ///
+    /// Run when a federation is brought up. The client's operation log is authoritative for
+    /// which operations exist; the SDK's records are a decoration over it that a crash between
+    /// the module's own commit and the SDK's write can leave incomplete. The one kind of entry
+    /// that is not an operation by itself is a wallet module's own bookkeeping, which
+    /// [`log_entry_is_not_an_operation`](crate::onchain::log_entry_is_not_an_operation) tells
+    /// apart and this pass leaves without a record.
+    ///
+    /// # Errors
+    ///
+    /// [`Storage`](crate::ErrorCode::Storage) for a failure reading the log or the index; a
+    /// failure backfilling one entry is logged and does not stop the rest of the pass (see
+    /// below), and is reported here only once every entry has had its turn, as the first such
+    /// failure.
+    pub(crate) async fn reconcile_operations(self: &Arc<Self>) -> crate::Result<()> {
+        use futures::StreamExt;
+
+        let db = self.db();
+        // Newest first, so an operation a crash left unrecorded a moment ago is reached first.
+        // The whole index is walked rather than a prefix of it, because a record can also need
+        // upgrading long after it was written, and a wallet's operation count is small.
+        let mut dbtx = db.begin_transaction_nc().await;
+        let entries: Vec<(fedimint_core::core::OperationId, u64)> = dbtx
+            .find_by_prefix_sorted_descending(
+                &fedimint_client::db::ChronologicalOperationLogKeyPrefix,
+            )
+            .await
+            .map(|(key, ())| (key.operation_id, crate::db::millis_of(key.creation_time)))
+            .collect()
+            .await;
+        drop(dbtx);
+
+        let mut first_err = None;
+        for (id, created_at) in entries {
+            let mut dbtx = db.begin_transaction_nc().await;
+            let stored = dbtx.get_value(&crate::db::OperationRecordKey(id)).await;
+            drop(dbtx);
+            let needs_work = match &stored {
+                None => true,
+                // Only the exact placeholder shape is offered to the backfillers again. A tag
+                // this build merely does not recognise is left alone even so: it may be a newer
+                // build's real kind, and rewriting it would lose a cancellation intent, a phase
+                // or a final state the log entry does not carry.
+                Some(record) => is_unclaimed_placeholder(record),
+            };
+            if !needs_work {
+                continue;
+            }
+            // One entry's storage trouble does not stop the rest of the pass: every other
+            // operation still gets its chance, and a lookup through `FederationInner::operation`
+            // repairs this specific id later regardless.
+            if let Err(err) = self.backfill_at(id, created_at).await {
+                tracing::warn!(
+                    target: "fedimint_sdk",
+                    federation = %self.id,
+                    operation = %id.fmt_full(),
+                    error = %err,
+                    "could not reconcile this operation's record",
+                );
+                first_err.get_or_insert(err);
+            }
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Rebuilds one operation's record from the client's log entry, dating it from the client's
+    /// own chronological index.
+    ///
+    /// `Ok(None)` when the log has no entry with that id, or has one that is not an operation
+    /// by itself (see [`backfill_at`](Self::backfill_at)): either way this federation has no
+    /// operation with that id.
+    async fn backfill(
+        self: &Arc<Self>,
+        id: fedimint_core::core::OperationId,
+    ) -> crate::Result<Option<crate::db::OperationRecord>> {
+        let db = self.db();
+        // The single-key lookup first: most calls here are `Federation::operation` asking about
+        // an id that was never real, and this answers that in O(1) rather than paying for the
+        // chronological scan below only to find nothing there either.
+        if fedimint_client::oplog::OperationLog::new(db.clone())
+            .get_operation(id)
+            .await
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let created_at = match self.creation_time_of(id).await {
+            Some(created_at) => created_at,
+            // No index entry means no operation: the client writes the entry and the index in
+            // one transaction (`fedimint-client/src/oplog.rs:82-118`).
+            None => return Ok(None),
+        };
+        self.backfill_at(id, created_at).await
+    }
+
+    /// The backfill proper, once the creation time is known.
+    async fn backfill_at(
+        self: &Arc<Self>,
+        id: fedimint_core::core::OperationId,
+        created_at: u64,
+    ) -> crate::Result<Option<crate::db::OperationRecord>> {
+        let db = self.db();
+        let Some(entry) = fedimint_client::oplog::OperationLog::new(db.clone())
+            .get_operation(id)
+            .await
+        else {
+            return Ok(None);
+        };
+        let module = entry.operation_module_kind().to_owned();
+        // `try_meta` rather than `meta`: the latter panics on a shape this build does not know,
+        // and every entry here was written by a module rather than by this crate.
+        let meta: serde_json::Value = entry.try_meta().unwrap_or(serde_json::Value::Null);
+
+        // Held from the check below to the write at the end, so two lookups racing over two
+        // claims of one walletv2 deposit cannot both find it without a record and write one each.
+        let _deposits = self.deposit_records.lock().await;
+        // Not every entry a wallet module logs is an operation of its own: an address it handed
+        // out is not, and neither is another claim of a deposit that already has its record.
+        if crate::onchain::log_entry_is_not_an_operation(self, id, &module, &meta).await {
+            return Ok(None);
+        }
+
+        let claimed = crate::operation::backfillers()
+            .into_iter()
+            .find_map(|backfiller| backfiller.backfill(id, &module, &meta, created_at));
+        let record = match claimed {
+            Some(claimed) => crate::db::OperationRecord {
+                schema_version: crate::operation::READABLE_STATE_SCHEMA,
+                kind: claimed.kind.to_owned(),
+                module,
+                created_at,
+                details: claimed.details,
+                phase: claimed.phase,
+                cancel_requested_at: None,
+                final_state: claimed.final_state,
+            },
+            // Nothing claimed it, so it is recorded under the module that owns it and reads back
+            // as a kind this build does not know: real, listable, and honestly not actionable.
+            // The module's own meta is kept verbatim so a later build has it to work from.
+            None => crate::db::OperationRecord {
+                schema_version: crate::operation::READABLE_STATE_SCHEMA,
+                kind: module.clone(),
+                module,
+                created_at,
+                details: meta.to_string(),
+                phase: None,
+                cancel_requested_at: None,
+                final_state: None,
+            },
+        };
+        // `overwrite_placeholder: true`: this rebuild is only ever reached for an id that had no
+        // record, or one that was itself the placeholder above, so replacing exactly that shape
+        // — and nothing else, if a race wrote something better in the meantime — is correct.
+        let record = self.write_record(id, record, true).await?;
+        Ok(Some(record))
+    }
+
+    /// When the client says this operation was created, from its own chronological index.
+    ///
+    /// Newest first, so a just-created operation is found on the first step. The client keeps no
+    /// creation time on the entry itself (`fedimint-client-module/src/oplog.rs:128-134`),
+    /// which is why the SDK's record carries its own copy.
+    async fn creation_time_of(&self, id: fedimint_core::core::OperationId) -> Option<u64> {
+        use futures::StreamExt;
+
+        let db = self.db();
+        let mut dbtx = db.begin_transaction_nc().await;
+        let mut keys = dbtx
+            .find_by_prefix_sorted_descending(
+                &fedimint_client::db::ChronologicalOperationLogKeyPrefix,
+            )
+            .await;
+        while let Some((key, ())) = keys.next().await {
+            if key.operation_id == id {
+                return Some(crate::db::millis_of(key.creation_time));
+            }
+        }
+        None
+    }
+
+    /// Commits one operation record and its index entry together, unless an existing record
+    /// already answers for this id and is not to be disturbed.
+    ///
+    /// The existence check happens inside the same autocommit transaction as the write, mirroring
+    /// [`OperationInner::record_final_state`]: a `get_value` read commits nothing, so repeating it
+    /// on every attempt is free, and it is the only way to be sure nothing else committed a
+    /// record for this id in the gap between whatever the caller read before calling this and
+    /// the write itself.
+    ///
+    /// `overwrite_placeholder` says whether an existing record that is itself
+    /// [`is_unclaimed_placeholder`] may still be replaced: both
+    /// [`create_operation`](Self::create_operation) and the backfill paths pass `true`, because a
+    /// placeholder is only ever a guess reconciliation made from the client's own log entry, and
+    /// the record either call builds from more than that — the caller's actual intent, or the
+    /// module's backfiller recognising it — always outranks it. A record that is not the
+    /// placeholder — one this build can already place, or one a newer build wrote under a tag
+    /// this build does not recognise — is always kept regardless. A placeholder rebuilt to the
+    /// same value it already had is a third case: eligible to be replaced, but with nothing to
+    /// gain from it, so no write happens.
+    ///
+    /// Returns whatever ends up authoritative for this id, so a caller never hands out a handle
+    /// or a lookup result for a record that lost a race it did not know it was in.
+    async fn write_record(
+        &self,
+        id: fedimint_core::core::OperationId,
+        record: crate::db::OperationRecord,
+        overwrite_placeholder: bool,
+    ) -> crate::Result<crate::db::OperationRecord> {
+        write_record_in(&self.db(), id, record, overwrite_placeholder).await
+    }
+
+    /// Bumps the client-instance identity that [`FederationInner::try_start_settle`] and friends
+    /// key on. Called by `install` and `replace_client` whenever a new client takes the place of
+    /// whatever was there, so a settle claimed for the old one is recognisable as stale.
+    fn bump_client_identity(&self) {
+        let mut settle = self.lock_settle();
+        settle.current += 1;
+    }
+
+    /// Locks the settle marker, recovering from a poisoned lock the way the plain `RwLock`s on
+    /// this type already do: a panic while it was held must not turn every later settle decision
+    /// into a panic of its own, and the marker guards no invariant a half-written value could
+    /// violate.
+    fn lock_settle(&self) -> std::sync::MutexGuard<'_, SettleMarker> {
+        self.settle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A federation handle with no client behind it, for the operation engine's own tests.
+    ///
+    /// The engine is exercised against a scripted driver rather than a live federation, so what
+    /// it needs from here is a namespace to read and write and an answer to
+    /// [`ensure_open`](FederationInner::ensure_open). Anything that reaches for the client gets
+    /// [`FederationClosed`](crate::ErrorCode::FederationClosed), which is the correct answer for
+    /// a federation with no client.
+    #[cfg(test)]
+    pub(crate) fn detached(db: Database, open: bool) -> Arc<FederationInner> {
+        use fedimint_core::PeerId;
+        use fedimint_core::invite_code::InviteCode;
+        use fedimint_core::util::SafeUrl;
+
+        use crate::db::{StoredCapabilities, StoredNetwork};
+
+        let (stored, status) = if open {
+            (StoredStatus::Open, FederationStatus::Running)
+        } else {
+            (StoredStatus::Closed, FederationStatus::Closed)
+        };
+        let id = config::FederationId::dummy();
+        let federation = FederationInner::new(
+            id,
+            Weak::new(),
+            db,
+            FederationRecord {
+                invite: InviteCode::new(
+                    SafeUrl::parse("wss://guardian.example:5000").expect("a valid url"),
+                    PeerId::from(0),
+                    id,
+                    None,
+                ),
+                network: StoredNetwork::Regtest,
+                status: stored,
+                capabilities: StoredCapabilities {
+                    ecash: true,
+                    lightning: true,
+                    onchain: true,
+                },
+                generation: Some(1),
+                name: None,
+            },
+            std::collections::BTreeMap::new(),
+            status.clone(),
+            None,
+        );
+        // `new` derives the closed watch from whether a client was handed over, and a detached
+        // federation never has one. Setting the status again puts the watch back in step with
+        // it, which is what a parked `OperationUpdates::next` is waiting on.
+        federation.set_status(status);
+        Arc::new(federation)
+    }
+}
+
+/// [`FederationInner::write_record`] for a caller that holds the federation's namespace database
+/// rather than the federation itself: the reopen path, which writes a recovery attempt's record
+/// into a namespace it has just wiped and redone, before the federation's shared state exists.
+pub(crate) async fn write_record_in(
+    db: &Database,
+    id: fedimint_core::core::OperationId,
+    record: crate::db::OperationRecord,
+    overwrite_placeholder: bool,
+) -> crate::Result<crate::db::OperationRecord> {
+    db.autocommit(
+        |dbtx, _| {
+            let record = record.clone();
+            Box::pin(async move {
+                let key = crate::db::OperationRecordKey(id);
+                if let Some(existing) = dbtx.get_value(&key).await {
+                    if !(overwrite_placeholder && is_unclaimed_placeholder(&existing)) {
+                        return Ok::<_, core::convert::Infallible>(existing);
+                    }
+                    // The rebuilt placeholder says nothing the stored one did not already
+                    // say: writing it again would touch storage for no observable
+                    // difference. This is what keeps reconciliation's steady-state pass over
+                    // a module no backfiller has learned to place a pure read, rather than a
+                    // rewrite of the same two rows on every federation open.
+                    if existing == record {
+                        return Ok::<_, core::convert::Infallible>(existing);
+                    }
+                    // Being replaced: its index entry is only still correct if the new
+                    // record keeps the same creation time. A backfill recomputes `created_at`
+                    // from the client's own chronological log, which need not agree with
+                    // whatever an earlier write guessed or was given, and leaving the old
+                    // entry behind would leak it under a key nothing will ever look up again.
+                    if existing.created_at != record.created_at {
+                        dbtx.remove_entry(&crate::db::OperationIndexKey {
+                            created_at: existing.created_at,
+                            id,
+                        })
+                        .await;
+                    }
+                }
+                dbtx.insert_entry(&key, &record).await;
+                dbtx.insert_entry(
+                    &crate::db::OperationIndexKey {
+                        created_at: record.created_at,
+                        id,
+                    },
+                    &(),
+                )
+                .await;
+                Ok::<_, core::convert::Infallible>(record)
+            })
+        },
+        Some(100),
+    )
+    .await
+    .map_err(crate::db::storage_error)
+}
+
+/// [`FederationInner::record_recovery_attempt`] over a namespace database, for the same caller.
+pub(crate) async fn record_recovery_attempt_in(
+    db: &Database,
+    attempt: fedimint_core::core::OperationId,
+) -> crate::Result<()> {
+    let record = crate::db::OperationRecord {
+        schema_version: crate::operation::READABLE_STATE_SCHEMA,
+        kind: kinds::RECOVERY.to_owned(),
+        module: String::new(),
+        created_at: crate::db::now_millis(),
+        details: "{}".to_owned(),
+        phase: None,
+        cancel_requested_at: None,
+        final_state: None,
+    };
+    write_record_in(db, attempt, record, false)
+        .await
+        .map(|_| ())
+}
+
+/// The federation a `'static` stream belongs to, looked up again rather than held.
+///
+/// A driver's stream outlives the call that built it and must not keep the federation, its
+/// client or a guard over either alive; a `Weak` to the instance and this lookup are what it
+/// carries instead. Gone, or no longer joined, reads as closed.
+pub(crate) fn federation_again(
+    sdk: &Weak<SdkInner>,
+    federation_id: config::FederationId,
+) -> Result<Arc<FederationInner>> {
+    let closed = || {
+        crate::Error::new(
+            crate::ErrorCode::FederationClosed,
+            "this federation stopped running",
+        )
+    };
+    let sdk = sdk.upgrade().ok_or_else(closed)?;
+    sdk.federation_inner(&federation_id).ok_or_else(closed)
+}
+
+/// Awaits `work`, which needs the client alive throughout, on a task of its own.
+///
+/// `client` is moved in and handed to `work`, and is dropped before this returns: whichever way
+/// the wait ended, the handle is already back by the time the caller is told about it.
+///
+/// # Why the wait is not simply awaited in place
+///
+/// [`shutdown_client`] needs the last reference to the handle, so a clone that outlives its
+/// purpose is a close that fails. A facade call may hold one safely, because dropping the call
+/// drops the clone with it. A driver's *stream* may not: the engine keeps the stream on the
+/// subscriber across a dropped `next` (see `OperationUpdates::next`), so an application that
+/// stops polling leaves it parked wherever its last `await` returned `Pending`, holding
+/// everything that `await` had borrowed for as long as the subscriber lives. Nothing polls it
+/// after that, which is what makes an unbounded client wait inside a stream unrecoverable: no
+/// `select!` written in there can fire and no timeout in there can elapse, because neither is
+/// ever polled again. An idle subscriber parked on one keeps the handle for ever, and every
+/// close from then on retires the federation and then fails with `Internal`, leaving it
+/// recorded as still running.
+///
+/// Running the wait on a task the runtime drives regardless of the caller is what keeps the
+/// handle reclaimable. `stop` is the client's own task-group shutdown token
+/// (`TaskHandle::make_shutdown_rx`), which both [`FederationInner::quiesce`] and
+/// [`FederationInner::replace_client`] fire before asking for the handle back — the same shape
+/// the recovery watcher uses, for the same reason. The task also gives up the moment the caller
+/// goes away, so a dropped subscription leaves nothing waiting behind it.
+pub(crate) async fn wait_holding_client<C, T, S, F, Fut>(client: C, stop: S, work: F) -> Result<T>
+where
+    C: MaybeSend + 'static,
+    T: MaybeSend + 'static,
+    S: Future<Output = ()> + MaybeSend + 'static,
+    F: FnOnce(C) -> Fut + MaybeSend + 'static,
+    Fut: Future<Output = Result<T>> + MaybeSend + 'static,
+{
+    let (mut tx, rx) = tokio::sync::oneshot::channel();
+    fedimint_core::task::spawn("sdk-client-wait", async move {
+        let outcome = {
+            let mut work = core::pin::pin!(work(client));
+            tokio::select! {
+                outcome = &mut work => Some(outcome),
+                () = stop => Some(Err(crate::Error::new(
+                    crate::ErrorCode::FederationClosed,
+                    "this federation stopped running",
+                ))),
+                // Nobody is left to answer: holding the client for an answer no one will read
+                // is the very thing this function exists to avoid.
+                () = tx.closed() => None,
+            }
+        };
+        // `work`, and with it the client handle it was given, is dropped by the block above,
+        // before the answer goes out. A caller told that the wait is over is therefore never
+        // racing the release of the handle it was waiting on: `shutdown_client` can have it.
+        if let Some(outcome) = outcome {
+            let _ = tx.send(outcome);
+        }
+    });
+
+    rx.await.unwrap_or_else(|_| {
+        // The sender goes without answering only if the task itself did, which outside a
+        // runtime being torn down under it cannot happen.
+        Err(crate::Error::new(
+            crate::ErrorCode::Internal,
+            "the wait on this federation's client did not finish",
+        ))
+    })
+}
+
+/// Shuts a client down, waiting for its workers.
+///
+/// `ClientHandle::shutdown` consumes the handle, so it needs the last reference. A clone that is
+/// still held is waited for, briefly; if it does not go, the best that can be done is to leave the
+/// executor stopped and let the eventual drop clean up, which upstream also logs about.
+pub(crate) async fn shutdown_client(mut client: ClientHandleArc) -> Result<()> {
+    // A stray clone is normally on its way out already: the recovery watcher drops its clone
+    // the moment the federation's `closed` watch flips, and a `wait_holding_client` task drops
+    // its own when the client's task group is told to stop — both of which every caller of this
+    // function has done before calling it, but those drops run on other tasks and may not have
+    // been scheduled yet. Waiting a bounded moment for them turns that race into a clean
+    // shutdown.
+    const STRAY_REFERENCE_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+    const STRAY_REFERENCE_ATTEMPTS: usize = 100;
+
+    let mut attempts = 0;
+    let handle = loop {
+        match Arc::try_unwrap(client) {
+            Ok(handle) => break handle,
+            Err(still_shared) => {
+                attempts += 1;
+                if attempts >= STRAY_REFERENCE_ATTEMPTS {
+                    return Err(crate::Error::new(
+                        crate::ErrorCode::Internal,
+                        "the federation's client is still in use elsewhere",
+                    ));
+                }
+                client = still_shared;
+                fedimint_core::runtime::sleep(STRAY_REFERENCE_WAIT).await;
+            }
+        }
+    };
+    handle.shutdown().await;
+    Ok(())
+}
+
+/// Reconciles a federation that has just come up, reporting a failure rather than failing the
+/// bring-up.
+///
+/// The client's operation log is authoritative and the SDK's records decorate it, so a crash
+/// between a module's own commit and the SDK's write leaves an entry with no record. Coming up
+/// is when that is repaired, and it is also when a record an earlier build could not place is
+/// offered to the facades this build has.
+//
+// A failure is logged rather than propagated: it leaves some history rows temporarily
+// unreadable, which is not a reason to deny an application its federation, its balance and the
+// rest of its history, and the per-id backfill in FederationInner::operation repairs whatever
+// this pass did not.
+pub(crate) async fn reconcile_on_open(federation: &Arc<FederationInner>) {
+    // Every call site reaches this once `set_status` has already run, including the branch
+    // `Sdk::restore` takes when opening the client itself failed: that federation is
+    // `Quarantined`, not open, and has no client installed to back a scan of its operation log
+    // with. Nothing about quarantine implies the log or the records changed, so there is nothing
+    // here for this pass to repair, and the per-id backfill in `FederationInner::operation`
+    // still covers a federation that is later reopened successfully.
+    if !federation.is_open() {
+        return;
+    }
+    if let Err(err) = federation.reconcile_operations().await {
+        tracing::warn!(
+            target: "fedimint_sdk",
+            federation = %federation.id,
+            error = %err,
+            "could not reconcile this federation's operation records",
+        );
+    }
+    // A deposit the wallet found while nothing was reading its announcements may have no
+    // record until this pass writes one, and a failure is again no reason to deny the bring-up:
+    // the next listing of activity runs the pass again.
+    if let Err(err) = crate::onchain::pick_up_deposits(federation).await {
+        tracing::warn!(
+            target: "fedimint_sdk",
+            federation = %federation.id,
+            error = %err,
+            "could not record the on-chain deposits this federation's wallet found",
+        );
+    }
+}
+
+// `FederationInner` gets no `Drop`. Dropping the last `Sdk` clone outside a tokio runtime must not
+// panic, and it does not need a `Drop` here to be safe: `ClientHandle::drop` checks
+// `RuntimeHandle::try_current()` and, without a runtime or on a current-thread one, falls back to a
+// non-blocking partial shutdown with an `error!` line instead of blocking
+// (`fedimint-client/src/client/handle.rs:155-200`). Dropping a handle anywhere is degraded rather
+// than fatal, and forgetting one would leak the client and the store's file lock for no reason.
+// `Sdk::shutdown` is still the way to get a clean stop.
+
+/// The spendable balance, read through a client the caller already has.
+///
+/// This exists so that a facade call holding a [`ClientGuard`] never reaches for a second one.
+/// [`FederationInner::client`] takes a read guard on a `tokio::sync::RwLock`, and that lock is
+/// write-preferring: once [`FederationInner::quiesce`] queues its writer, further readers block
+/// behind it. A call that took a read guard, then asked for another one while still holding the
+/// first, would deadlock against a close that arrives between the two — the second read waits on
+/// the queued writer, and the writer waits on the guard the caller is still holding.
+///
+/// Reading the balance is the one place that came up in practice, because
+/// [`FederationInner::balance`] acquires its own guard; callers already inside a guarded section
+/// pass it here instead.
+pub(crate) async fn balance_of(client: &Client, status: FederationStatus) -> Result<Amount> {
+    let balance = match client.get_balance_for_unit(AmountUnit::BITCOIN).await {
+        Ok(balance) => balance,
+        // A v1 mint recovers as `RecoveryMode::Unusable` and is left out of the client's
+        // module registry until the client is opened again after the rescan
+        // (`fedimint-client/src/client/builder.rs:955`), so a recovering federation of that
+        // generation has no balance source at all yet. What has been recovered *so far* into
+        // something spendable is then exactly nothing, which is the provisional figure the
+        // docs promise; the swap that ends the recovery brings the real one.
+        Err(_) if status == FederationStatus::Recovering => {
+            return Ok(Amount::from_msats(0));
+        }
+        Err(err) => {
+            return Err(crate::Error::new(
+                crate::ErrorCode::Internal,
+                format!(
+                    "this federation cannot report a balance: {}",
+                    err.fmt_compact()
+                ),
+            ));
+        }
+    };
+    Ok(Amount::from_msats(balance.msats))
+}
+
+/// A read guard over one federation's live client.
+///
+/// Holding it keeps a close, an erase or a shutdown waiting until the call is done.
+pub(crate) struct ClientGuard<'a>(tokio::sync::RwLockReadGuard<'a, Option<ClientHandleArc>>);
+
+impl ClientGuard<'_> {
+    /// A clone of the client behind this guard, for a wait that must outlive the guard itself:
+    /// the recovery watcher, which drops its guard and then blocks on the client alone, and the
+    /// mintv2 facades, which drop theirs before an unbounded wait on consensus. Whoever takes
+    /// one owes it back before the federation can close — [`wait_holding_client`] is how a
+    /// stream keeps that promise, and [`shutdown_client`] is what collects on it.
+    pub(crate) fn handle(&self) -> ClientHandleArc {
+        self.0
+            .as_ref()
+            .expect("a client guard is only built while the client is live")
+            .clone()
+    }
+}
+
+impl core::ops::Deref for ClientGuard<'_> {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        let handle: &fedimint_client::ClientHandle = self
+            .0
+            .as_ref()
+            .expect("a client guard is only built while the client is live");
+        handle
+    }
+}
+
+impl core::fmt::Debug for ClientGuard<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ClientGuard")
+    }
+}
+
+/// One independent balance subscription's state.
+///
+/// The upstream stream is created on the first `next()` rather than here, so that handing out a
+/// subscriber stays infallible even for a federation that has no client to subscribe to.
+pub(crate) struct BalanceUpdatesInner {
+    federation: Arc<FederationInner>,
+    cursor: tokio::sync::Mutex<BalanceCursor>,
+}
+
+impl core::fmt::Debug for BalanceUpdatesInner {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BalanceUpdates")
+            .field("federation", &self.federation.id)
+            .finish()
+    }
+}
+
+/// Reads a lock without propagating poisoning.
+///
+/// A panic in one thread must not turn every later status read into a panic of its own: these
+/// locks guard plain snapshots, and a half-written one is not a possibility.
+pub(crate) fn read_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Writes a lock without propagating poisoning. See [`read_lock`].
+pub(crate) fn write_lock<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Where one balance subscription has got to.
+struct BalanceCursor {
+    /// The upstream stream, once the first `next()` has established there is a client to open it
+    /// on. Upstream's own stream hangs forever when a client has no primary module, so it is only
+    /// opened after a balance read has proved there is one.
+    stream: Option<fedimint_core::util::BoxStream<'static, fedimint_core::Amount>>,
+    /// Subscribed just before `stream` was, so the recovery swap that retires the client behind
+    /// it is seen and the stream re-established over the successor.
+    recovery_changed: Option<tokio::sync::watch::Receiver<u64>>,
+    /// The last value handed out, so a repeat is not delivered as a change.
+    last: Option<Amount>,
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use std::sync::{Arc, Weak};
+
+    use fedimint_client::oplog::OperationLog;
+    use fedimint_core::PeerId;
+    use fedimint_core::config::FederationId as UpstreamFederationId;
+    use fedimint_core::core::OperationId as UpstreamOperationId;
+    use fedimint_core::db::Database;
+    use fedimint_core::db::IDatabaseTransactionOpsCoreTyped;
+    use fedimint_core::db::mem_impl::MemDatabase;
+    use fedimint_core::module::registry::ModuleDecoderRegistry;
+    use fedimint_core::util::SafeUrl;
+
+    use crate::db::{
+        FederationRecord, OperationRecord, OperationRecordKey, StoredCapabilities, StoredNetwork,
+        StoredStatus, federation_namespace, in_memory_root,
+    };
+    use crate::operation::{READABLE_STATE_SCHEMA, kinds};
+    use crate::{ErrorCode, FederationStatus};
+
+    use super::*;
+
+    /// Writes an operation log entry the way the client itself does, so that the reconciliation
+    /// path is exercised against a real entry rather than a stand-in.
+    async fn write_log_entry(
+        db: &Database,
+        id: UpstreamOperationId,
+        module_kind: &str,
+        meta: serde_json::Value,
+    ) {
+        let mut dbtx = db.begin_transaction().await;
+        OperationLog::new(db.clone())
+            .add_operation_log_entry_dbtx(&mut dbtx.to_ref_nc(), id, module_kind, meta)
+            .await;
+        dbtx.commit_tx().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_id_is_not_an_error() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db, true);
+        assert!(
+            federation
+                .operation(UpstreamOperationId([9u8; 32]))
+                .await
+                .expect("a missing operation is a normal answer")
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_log_entry_with_no_record_is_backfilled_when_it_is_looked_up() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db.clone(), true);
+        let id = UpstreamOperationId([9u8; 32]);
+        // The crash window: the module committed its entry, the SDK never wrote its record. No
+        // backfiller in this build claims `unclaimed_module`, which is the case this test wants.
+        write_log_entry(
+            &db,
+            id,
+            "unclaimed_module",
+            serde_json::json!({"kept": true}),
+        )
+        .await;
+
+        let any = federation
+            .operation(id)
+            .await
+            .expect("lookup")
+            .expect("an entry the SDK never recorded is still a real operation");
+        // Nothing claimed it, so it is honestly reported as a kind this build cannot place.
+        assert_eq!(any.kind(), crate::OperationKind::Unknown);
+        assert_eq!(any.raw_kind().module.as_deref(), Some("unclaimed_module"));
+
+        // And the record is now there, so the next lookup does not have to rebuild it.
+        let mut dbtx = db.begin_transaction_nc().await;
+        let record = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("the backfill was committed");
+        assert_eq!(record.module, "unclaimed_module");
+        assert!(record.created_at > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconciliation_gives_a_claimed_entry_its_real_kind() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db.clone(), true);
+        let id = UpstreamOperationId([9u8; 32]);
+        write_log_entry(&db, id, "probe_module", serde_json::json!({"kept": true})).await;
+
+        federation.reconcile_operations().await.expect("reconcile");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let record = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("the backfill was committed");
+        assert_eq!(record.kind, kinds::ECASH_SEND);
+        assert_eq!(record.details, r#"{"kept":true}"#);
+        assert_eq!(record.phase, Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconciliation_upgrades_a_record_a_later_build_can_place() {
+        use futures::StreamExt;
+
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let id = UpstreamOperationId([9u8; 32]);
+        write_log_entry(&db, id, "probe_module", serde_json::json!({"kept": true})).await;
+
+        // Exactly what a build with no backfiller for this module wrote: the module kind
+        // verbatim as the tag, which reads back as a kind that build could not place.
+        let earlier = crate::db::OperationRecord {
+            schema_version: crate::operation::READABLE_STATE_SCHEMA,
+            kind: "probe_module".to_owned(),
+            module: "probe_module".to_owned(),
+            created_at: 1,
+            details: r#"{"kept":true}"#.to_owned(),
+            phase: None,
+            cancel_requested_at: None,
+            final_state: None,
+        };
+        assert_eq!(
+            crate::operation::kind_of_tag(&earlier.kind),
+            crate::OperationKind::Unknown
+        );
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_entry(&OperationRecordKey(id), &earlier).await;
+        // The index entry a real write through `write_record` would also have left, dated the
+        // same `created_at: 1` the earlier build guessed: the actual chronological log entry
+        // above was written just now, so reconciliation's own reading of `created_at` disagrees
+        // with it, and this is what would otherwise leak as a stale index row.
+        dbtx.insert_entry(
+            &crate::db::OperationIndexKey {
+                created_at: earlier.created_at,
+                id,
+            },
+            &(),
+        )
+        .await;
+        dbtx.commit_tx().await;
+
+        // This build does know the module, so reconciliation offers the record to the
+        // backfillers again and replaces the earlier reading rather than leaving it.
+        let later = FederationInner::detached(db.clone(), true);
+        later.reconcile_operations().await.expect("reconcile");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let record = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("record");
+        assert_eq!(record.kind, kinds::ECASH_SEND);
+        assert_ne!(record.created_at, earlier.created_at);
+
+        // The stale index entry from the earlier `created_at` is gone rather than left behind
+        // beside the new one.
+        let indexed: Vec<_> = dbtx
+            .find_by_prefix_sorted_descending(&crate::db::OperationIndexKeyPrefix)
+            .await
+            .map(|(key, ())| (key.created_at, key.id))
+            .collect()
+            .await;
+        assert_eq!(indexed, vec![(record.created_at, id)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconciliation_leaves_an_unrecognised_facade_tag_alone() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db.clone(), true);
+        let id = UpstreamOperationId([9u8; 32]);
+        // A log entry has to exist or reconciliation never visits this id at all; the module is
+        // deliberately one no backfiller in this build claims, so a claim can never be the
+        // reason the record below survives.
+        write_log_entry(&db, id, "mint", serde_json::json!({"kept": true})).await;
+
+        // What a newer build's facade wrote: a real kind tag this build does not recognise, over
+        // a module this build also has no backfiller for. It is not the placeholder shape
+        // (`kind == module` is false here), which is the only thing that tells the two apart.
+        let newer = crate::db::OperationRecord {
+            schema_version: crate::operation::READABLE_STATE_SCHEMA,
+            kind: "future_send".to_owned(),
+            module: "mint".to_owned(),
+            created_at: 1,
+            details: r#"{"kept":true}"#.to_owned(),
+            phase: Some(3),
+            cancel_requested_at: Some(9),
+            final_state: Some("done".to_owned()),
+        };
+        assert_eq!(
+            crate::operation::kind_of_tag(&newer.kind),
+            crate::OperationKind::Unknown
+        );
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_entry(&OperationRecordKey(id), &newer).await;
+        dbtx.commit_tx().await;
+
+        federation.reconcile_operations().await.expect("reconcile");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let after = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("record");
+        // Untouched: only the placeholder shape is ever offered to the backfillers again, and a
+        // tag this build cannot place is not the same thing — rewriting it would have lost
+        // everything below that the log entry alone does not carry.
+        assert_eq!(after.kind, "future_send");
+        assert_eq!(after.cancel_requested_at, Some(9));
+        assert_eq!(after.phase, Some(3));
+        assert_eq!(after.final_state.as_deref(), Some("done"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconciliation_of_a_still_unclaimed_module_writes_nothing_the_second_time() {
+        use futures::StreamExt;
+
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db.clone(), true);
+        let id = UpstreamOperationId([9u8; 32]);
+        // No backfiller in this build claims `unclaimed_module`, so the placeholder the first
+        // pass writes is already the best this build can ever do for it: a second pass rebuilds
+        // the exact same value rather than something new to write.
+        write_log_entry(
+            &db,
+            id,
+            "unclaimed_module",
+            serde_json::json!({"kept": true}),
+        )
+        .await;
+        federation
+            .reconcile_operations()
+            .await
+            .expect("first reconcile");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let record = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("record");
+        let indexed: Vec<_> = dbtx
+            .find_by_prefix_sorted_descending(&crate::db::OperationIndexKeyPrefix)
+            .await
+            .map(|(key, ())| (key.created_at, key.id))
+            .collect()
+            .await;
+        drop(dbtx);
+
+        federation
+            .reconcile_operations()
+            .await
+            .expect("second reconcile");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let after = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("record");
+        let indexed_after: Vec<_> = dbtx
+            .find_by_prefix_sorted_descending(&crate::db::OperationIndexKeyPrefix)
+            .await
+            .map(|(key, ())| (key.created_at, key.id))
+            .collect()
+            .await;
+        // Byte-for-byte the same as after the first pass, index included: the second pass found
+        // nothing worth writing back.
+        assert_eq!(after, record);
+        assert_eq!(indexed_after, indexed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconciliation_leaves_a_record_the_sdk_wrote_alone() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db.clone(), true);
+        let id = UpstreamOperationId([9u8; 32]);
+        write_log_entry(&db, id, "probe_module", serde_json::json!({"kept": true})).await;
+        federation
+            .reconcile_operations()
+            .await
+            .expect("first reconcile");
+
+        let mut dbtx = db.begin_transaction().await;
+        let mut record = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("record");
+        record.cancel_requested_at = Some(7);
+        dbtx.insert_entry(&OperationRecordKey(id), &record).await;
+        dbtx.commit_tx().await;
+
+        federation
+            .reconcile_operations()
+            .await
+            .expect("second reconcile");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let after = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("record");
+        // A record this build can place is never rewritten, so nothing it accumulated is lost.
+        assert_eq!(after.cancel_requested_at, Some(7));
+    }
+
+    fn closed_federation(capabilities: StoredCapabilities) -> Arc<FederationInner> {
+        let id = UpstreamFederationId::dummy();
+        let root = Database::new(MemDatabase::new(), ModuleDecoderRegistry::default());
+        let record = FederationRecord {
+            invite: fedimint_core::invite_code::InviteCode::new(
+                SafeUrl::parse("wss://guardian.example:5000").expect("a valid url"),
+                PeerId::from(0),
+                id,
+                None,
+            ),
+            network: StoredNetwork::Regtest,
+            status: StoredStatus::Closed,
+            capabilities,
+            generation: Some(1),
+            name: Some("Test Federation".to_owned()),
+        };
+        Arc::new(FederationInner::new(
+            id,
+            Weak::new(),
+            root.with_prefix(crate::db::federation_prefix(&id).to_vec()),
+            record,
+            std::collections::BTreeMap::new(),
+            FederationStatus::Closed,
+            None,
+        ))
+    }
+
+    fn everything() -> StoredCapabilities {
+        StoredCapabilities {
+            ecash: true,
+            lightning: true,
+            onchain: true,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_federation_refuses_every_fallible_call() {
+        let federation = Federation::new(closed_federation(everything()));
+        let err = federation
+            .balance()
+            .await
+            .expect_err("a closed federation refuses");
+        assert_eq!(err.code, ErrorCode::FederationClosed);
+    }
+
+    #[test]
+    fn a_closed_federation_still_describes_itself() {
+        // A history screen has to be able to label rows with a federation that was
+        // closed underneath it, so none of these may fail or go blank.
+        let federation = Federation::new(closed_federation(everything()));
+        assert_eq!(federation.name().as_deref(), Some("Test Federation"));
+        assert_eq!(federation.network(), crate::Network::Regtest);
+        assert_eq!(
+            federation.capabilities(),
+            crate::Capabilities {
+                ecash: true,
+                lightning: true,
+                onchain: true
+            }
+        );
+        assert_eq!(
+            federation.id(),
+            crate::FederationId::from_upstream(UpstreamFederationId::dummy())
+        );
+        // The invite code renders, and renders redacted.
+        assert_eq!(
+            format!("{:?}", federation.invite_code()),
+            "InviteCode(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn facade_accessors_answer_for_the_module_set_not_for_the_state() {
+        // `None` means "this federation has no mint module", so a closed federation
+        // that has one must still hand out the facade; the failure belongs on the
+        // facade's own calls.
+        let federation = Federation::new(closed_federation(everything()));
+        assert!(federation.ecash().is_some());
+        assert!(federation.lightning().is_some());
+        assert!(federation.onchain().is_some());
+
+        let mint_only = Federation::new(closed_federation(StoredCapabilities {
+            ecash: true,
+            lightning: false,
+            onchain: false,
+        }));
+        assert!(mint_only.ecash().is_some());
+        assert!(mint_only.lightning().is_none());
+        assert!(mint_only.onchain().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_federation_still_hands_out_a_balance_subscriber() {
+        // The error belongs where a caller can act on it rather than being
+        // swallowed by an accessor that cannot return one.
+        let federation = Federation::new(closed_federation(everything()));
+        let mut updates = federation.balance_updates();
+        let err = updates
+            .next()
+            .await
+            .expect_err("the first call reports the closure");
+        assert_eq!(err.code, ErrorCode::FederationClosed);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovering_federation_refuses_only_fund_touching_calls() {
+        let inner = closed_federation(everything());
+        inner.set_status(FederationStatus::Recovering);
+        // Without a client there is nothing to hand out either way, but the
+        // recovery lock has to be reported as itself rather than as a closure.
+        let err = inner
+            .client(true)
+            .await
+            .expect_err("a recovery-locked federation refuses fund-touching work");
+        assert_eq!(err.code, ErrorCode::Recovering);
+    }
+
+    #[test]
+    fn a_detached_federation_answers_from_its_record_and_its_namespace() {
+        let root = in_memory_root();
+        let db = federation_namespace(&root, [1u8; 32]);
+        let federation = FederationInner::detached(db.clone(), true);
+        // The namespace is the one the client would have been handed, so the SDK's records and
+        // the client's operation log share a keyspace.
+        assert!(federation.db().is_global());
+        assert!(federation.ensure_open().is_ok());
+
+        let closed = FederationInner::detached(db, false);
+        let err = closed
+            .ensure_open()
+            .expect_err("a closed federation refuses every fallible call");
+        assert_eq!(err.code, crate::ErrorCode::FederationClosed);
+    }
+
+    #[test]
+    fn a_federation_that_is_not_running_refuses_every_fallible_call() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+
+        // A stored row that is not `Open` is refused whatever the live status says. `Joining` is
+        // the one that is easy to read as open and is not: it is an interrupted join whose
+        // namespace the next build wipes and redoes from the invite.
+        for stored in [
+            StoredStatus::Joining,
+            StoredStatus::Closed,
+            StoredStatus::Forgetting,
+        ] {
+            let federation = FederationInner::detached(db.clone(), true);
+            let mut record = federation.record();
+            record.status = stored;
+            federation.set_record(record);
+            assert_eq!(
+                federation
+                    .ensure_open()
+                    .expect_err("only an open row is open")
+                    .code,
+                crate::ErrorCode::FederationClosed,
+                "{stored:?}"
+            );
+        }
+
+        // And an `Open` row is still refused once the running federation is not. Quarantine is
+        // the case that matters: the storage is intact, so the row never changes, and the
+        // contract says every subsequent fallible call on a quarantined federation fails.
+        let federation = FederationInner::detached(db, true);
+        federation.set_status(FederationStatus::Quarantined {
+            diagnostic: crate::Diagnostic::new(
+                crate::ErrorCode::FederationUnreachable,
+                "no guardian answered",
+            ),
+        });
+        assert_eq!(
+            federation
+                .ensure_open()
+                .expect_err("a quarantined federation is not usable")
+                .code,
+            crate::ErrorCode::FederationClosed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn creating_an_operation_writes_its_record_and_its_index_entry() {
+        use futures::StreamExt;
+
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db.clone(), true);
+        let id = UpstreamOperationId([5u8; 32]);
+        federation
+            .create_operation(
+                id,
+                kinds::ECASH_SEND,
+                "mint",
+                &serde_json::json!({"notes": "…"}),
+                Arc::new(crate::operation::ProbeEcashSendDriver)
+                    as Arc<dyn crate::operation::Driver<crate::EcashSendState>>,
+            )
+            .await
+            .expect("create");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let record = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("record");
+        assert_eq!(record.kind, kinds::ECASH_SEND);
+        assert_eq!(record.module, "mint");
+        assert_eq!(
+            record.schema_version,
+            crate::operation::READABLE_STATE_SCHEMA
+        );
+        assert_eq!(record.final_state, None);
+
+        let indexed: Vec<_> = dbtx
+            .find_by_prefix_sorted_descending(&crate::db::OperationIndexKeyPrefix)
+            .await
+            .map(|(key, ())| (key.created_at, key.id))
+            .collect()
+            .await;
+        assert_eq!(indexed, vec![(record.created_at, id)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_operation_never_overwrites_an_existing_record() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db.clone(), true);
+        let id = UpstreamOperationId([5u8; 32]);
+
+        // Something real is already recorded at this id — not the placeholder shape, so it is
+        // not a guess reconciliation could have raced this call to write. An id the client
+        // itself mints fresh for every real call, so this can only mean another write already
+        // won a race against the one below, and it must be left exactly as it is.
+        let existing = crate::db::OperationRecord {
+            schema_version: crate::operation::READABLE_STATE_SCHEMA,
+            kind: kinds::ECASH_SEND.to_owned(),
+            module: "mint".to_owned(),
+            created_at: 1,
+            details: "{}".to_owned(),
+            phase: None,
+            cancel_requested_at: None,
+            final_state: None,
+        };
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_entry(&OperationRecordKey(id), &existing).await;
+        dbtx.commit_tx().await;
+
+        federation
+            .create_operation(
+                id,
+                kinds::ECASH_SEND,
+                "mint",
+                &serde_json::json!({"different": true}),
+                Arc::new(crate::operation::ProbeEcashSendDriver)
+                    as Arc<dyn crate::operation::Driver<crate::EcashSendState>>,
+            )
+            .await
+            .expect("create");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let record = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("record");
+        // The existing record won, not the one this call tried to write.
+        assert_eq!(record.details, "{}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_operation_overwrites_an_unclaimed_placeholder() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db.clone(), true);
+        let id = UpstreamOperationId([5u8; 32]);
+
+        // Exactly the shape reconciliation could have raced this call to write: the module kind
+        // copied verbatim as the tag, guessed from the client's own log entry alone, with the
+        // index entry a real write through `write_record` would also have left.
+        let placeholder = crate::db::OperationRecord {
+            schema_version: crate::operation::READABLE_STATE_SCHEMA,
+            kind: "mint".to_owned(),
+            module: "mint".to_owned(),
+            created_at: 1,
+            details: "{}".to_owned(),
+            phase: None,
+            cancel_requested_at: None,
+            final_state: None,
+        };
+        let mut dbtx = db.begin_transaction().await;
+        dbtx.insert_entry(&OperationRecordKey(id), &placeholder)
+            .await;
+        dbtx.insert_entry(
+            &crate::db::OperationIndexKey {
+                created_at: placeholder.created_at,
+                id,
+            },
+            &(),
+        )
+        .await;
+        dbtx.commit_tx().await;
+
+        let operation = federation
+            .create_operation(
+                id,
+                kinds::ECASH_SEND,
+                "mint",
+                &serde_json::json!({"real": true}),
+                Arc::new(crate::operation::ProbeEcashSendDriver)
+                    as Arc<dyn crate::operation::Driver<crate::EcashSendState>>,
+            )
+            .await
+            .expect("create");
+
+        // The handle already carries what was actually written, not the placeholder it replaced.
+        assert_eq!(operation.inner().record.kind, kinds::ECASH_SEND);
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let record = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("record");
+        assert_eq!(record.kind, kinds::ECASH_SEND);
+        assert_ne!(record.created_at, placeholder.created_at);
+
+        // The placeholder's index entry is gone; only the fresh one is left.
+        let indexed: Vec<_> = dbtx
+            .find_by_prefix_sorted_descending(&crate::db::OperationIndexKeyPrefix)
+            .await
+            .map(|(key, ())| (key.created_at, key.id))
+            .collect()
+            .await;
+        assert_eq!(indexed, vec![(record.created_at, id)]);
+    }
+
+    /// A stand-in `ONCHAIN_RECEIVE` details record of a deposit to `address`, in exactly the
+    /// shape `onchain::wire::OnchainReceiveDetailsWire` serialises: this module cannot name that
+    /// type itself, so the JSON is built by hand from its documented field names instead.
+    fn onchain_receive_details(address: &str) -> serde_json::Value {
+        serde_json::json!({
+            "address": address,
+            "txid": "11".repeat(32),
+            "gross_deposited_sats": 70_000u64,
+            "fee_msats": null,
+            "fee_breakdown": null,
+            "net_credit_msats": null,
+            "created_at": 1_700_000_000_000u64,
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn has_seen_unclaimed_deposit_tracks_the_final_state() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db.clone(), true);
+        let id = UpstreamOperationId([8u8; 32]);
+        federation
+            .create_operation(
+                id,
+                kinds::ONCHAIN_RECEIVE,
+                "wallet",
+                &onchain_receive_details("paid-address"),
+                Arc::new(crate::onchain::OnchainReceiveDriver)
+                    as Arc<dyn crate::operation::Driver<crate::OnchainReceiveState>>,
+            )
+            .await
+            .expect("create");
+
+        // A deposit with no final state is a claim in progress.
+        assert!(
+            federation
+                .has_seen_unclaimed_deposit()
+                .await
+                .expect("lookup")
+        );
+
+        // Once a final state lands, the deposit is settled one way or the other and no longer
+        // blocks an erase.
+        let mut dbtx = db.begin_transaction().await;
+        let mut record = dbtx
+            .get_value(&OperationRecordKey(id))
+            .await
+            .expect("the record just created");
+        record.final_state = Some("\"claimed\"".to_owned());
+        dbtx.insert_entry(&OperationRecordKey(id), &record).await;
+        dbtx.commit_tx().await;
+        assert!(
+            !federation
+                .has_seen_unclaimed_deposit()
+                .await
+                .expect("lookup")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_operation_is_found_again_through_a_fresh_handle_over_the_same_store() {
+        let root = in_memory_root();
+        let db = federation_namespace(&root, [1u8; 32]);
+        let id = UpstreamOperationId([5u8; 32]);
+
+        let created = {
+            let federation = FederationInner::detached(db.clone(), true);
+            let operation = federation
+                .create_operation(
+                    id,
+                    kinds::ECASH_SEND,
+                    "mint",
+                    &serde_json::json!({"notes": "…"}),
+                    Arc::new(crate::operation::ProbeEcashSendDriver)
+                        as Arc<dyn crate::operation::Driver<crate::EcashSendState>>,
+                )
+                .await
+                .expect("create");
+            operation.inner().record.clone()
+            // Every handle from that run is dropped here, as it would be by a shutdown.
+        };
+
+        // A new run over the same store, through a fresh federation handle.
+        let reopened = FederationInner::detached(db, true);
+        let found = reopened
+            .operation(id)
+            .await
+            .expect("lookup")
+            .expect("the operation is still there");
+        assert_eq!(found.kind(), crate::OperationKind::EcashSend);
+        assert_eq!(found.id(), crate::OperationId::from_upstream(id));
+        // The whole record, unchanged: the id is all it takes to pick an operation back up.
+        let typed = found.as_ecash_send().expect("a typed handle");
+        assert_eq!(typed.inner().record, created);
+        assert_eq!(
+            typed.state().await.expect("state"),
+            crate::EcashSendState::Redeemed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_operation_survives_a_real_close_and_reopen_of_the_store() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let id = UpstreamOperationId([5u8; 32]);
+
+        let created = {
+            let root = crate::db::open_native_root(dir.path()).await.expect("open");
+            let federation =
+                FederationInner::detached(federation_namespace(&root, [1u8; 32]), true);
+            let operation = federation
+                .create_operation(
+                    id,
+                    kinds::ONCHAIN_RECEIVE,
+                    "wallet",
+                    &serde_json::json!({"address": "…"}),
+                    Arc::new(crate::operation::ProbeEcashSendDriver)
+                        as Arc<dyn crate::operation::Driver<crate::EcashSendState>>,
+                )
+                .await
+                .expect("create");
+            operation.inner().record.clone()
+            // The database handle is dropped here, which is what releases the store.
+        };
+
+        let root = crate::db::open_native_root(dir.path())
+            .await
+            .expect("reopen");
+        let federation = FederationInner::detached(federation_namespace(&root, [1u8; 32]), true);
+        let found = federation
+            .operation(id)
+            .await
+            .expect("lookup")
+            .expect("the operation is still there after a real restart");
+        assert_eq!(found.kind(), crate::OperationKind::OnchainReceive);
+        assert_eq!(found.raw_kind().module.as_deref(), Some("wallet"));
+        // On-chain has a driver, so the typed handle exists here; what this test actually checks
+        // is that the record survives a real restart, below.
+        assert!(found.as_onchain_receive().is_some());
+        // The record itself is byte-for-byte what was written before the restart.
+        let db = federation.db();
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.get_value(&OperationRecordKey(id)).await.as_ref(),
+            Some(&created)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recording_an_attempt_writes_a_running_record_once() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db.clone(), true);
+        let attempt = UpstreamOperationId([6u8; 32]);
+
+        federation
+            .record_recovery_attempt(attempt)
+            .await
+            .expect("record");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        let record = dbtx
+            .get_value(&OperationRecordKey(attempt))
+            .await
+            .expect("the attempt's record was written");
+        assert_eq!(record.kind, kinds::RECOVERY);
+        assert_eq!(record.module, "");
+        assert_eq!(record.details, "{}");
+        assert_eq!(record.schema_version, READABLE_STATE_SCHEMA);
+        assert_eq!(record.final_state, None);
+        let indexed: Vec<_> = dbtx
+            .find_by_prefix_sorted_descending(&crate::db::OperationIndexKeyPrefix)
+            .await
+            .map(|(key, ())| (key.created_at, key.id))
+            .collect()
+            .await;
+        assert_eq!(indexed, vec![(record.created_at, attempt)]);
+        drop(dbtx);
+
+        // A driver observed the rescan finish and recorded it, which a second call must not
+        // undo: `record_recovery_attempt` only ever gets the attempt started, never rewrites it.
+        let mut dbtx = db.begin_transaction().await;
+        let finished = OperationRecord {
+            final_state: Some("\"Done\"".to_owned()),
+            ..record.clone()
+        };
+        dbtx.insert_entry(&OperationRecordKey(attempt), &finished)
+            .await;
+        dbtx.commit_tx().await;
+
+        federation
+            .record_recovery_attempt(attempt)
+            .await
+            .expect("record again");
+
+        let mut dbtx = db.begin_transaction_nc().await;
+        assert_eq!(
+            dbtx.get_value(&OperationRecordKey(attempt)).await,
+            Some(finished)
+        );
+        let indexed_after: Vec<_> = dbtx
+            .find_by_prefix_sorted_descending(&crate::db::OperationIndexKeyPrefix)
+            .await
+            .map(|(key, ())| (key.created_at, key.id))
+            .collect()
+            .await;
+        assert_eq!(indexed_after, vec![(record.created_at, attempt)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bumping_recovery_wakes_a_subscriber() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db, true);
+        let mut updates = federation.recovery_changed();
+
+        federation.bump_recovery();
+
+        updates.changed().await.expect("the sender is still alive");
+        assert_eq!(*updates.borrow(), 1);
+    }
+
+    /// A wait that never ends by itself, over a stand-in for the client handle.
+    ///
+    /// `Arc<()>` stands in because a `ClientHandleArc` cannot be built without a federation to
+    /// open a client against, and it is the right stand-in: `shutdown_client` reclaims the real
+    /// one with `Arc::try_unwrap`, so a strong count back at one is exactly the condition these
+    /// tests are about.
+    async fn a_wait_that_never_ends(held: std::sync::Arc<()>) -> Result<&'static str> {
+        let _held = held;
+        futures::future::pending::<()>().await;
+        Ok("unreachable")
+    }
+
+    /// A `stop` future in the shape of the client's task-group shutdown token.
+    async fn told_to_stop(mut rx: tokio::sync::watch::Receiver<bool>) {
+        let _ = rx.wait_for(|stopping| *stopping).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_wait_hands_its_answer_back() {
+        let handle = std::sync::Arc::new(());
+        let (_stop, rx) = tokio::sync::watch::channel(false);
+
+        let answer = wait_holding_client(handle.clone(), told_to_stop(rx), |held| async move {
+            drop(held);
+            Ok("settled")
+        })
+        .await
+        .expect("the wait finished on its own");
+
+        assert_eq!(answer, "settled");
+        assert_eq!(
+            std::sync::Arc::strong_count(&handle),
+            1,
+            "a finished wait keeps nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_wait_gives_the_handle_back_when_the_client_is_told_to_stop() {
+        let handle = std::sync::Arc::new(());
+        let (stop, rx) = tokio::sync::watch::channel(false);
+
+        // The wait itself never ends, so the only thing that can end it is the stop signal —
+        // which is what `quiesce` fires on the client's task group before `shutdown_client`
+        // asks for the last reference.
+        let (outcome, ()) = tokio::join!(
+            wait_holding_client(handle.clone(), told_to_stop(rx), a_wait_that_never_ends),
+            async {
+                tokio::task::yield_now().await;
+                stop.send_replace(true);
+            }
+        );
+
+        assert_eq!(
+            outcome.expect_err("the wait ends with the client").code,
+            ErrorCode::FederationClosed
+        );
+        // Already back by the time the caller is told, with no waiting around for it: the
+        // handle is dropped before the answer is sent.
+        assert_eq!(
+            std::sync::Arc::strong_count(&handle),
+            1,
+            "the handle a stopped client's wait held was not given back"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_wait_nobody_is_listening_to_gives_the_handle_back() {
+        let handle = std::sync::Arc::new(());
+        // Never fired: this is the other way a wait ends, with the subscription that wanted the
+        // answer dropped before there was one.
+        let (_stop, rx) = tokio::sync::watch::channel(false);
+
+        {
+            let mut waiting = Box::pin(wait_holding_client(
+                handle.clone(),
+                told_to_stop(rx),
+                a_wait_that_never_ends,
+            ));
+            let mut cx = core::task::Context::from_waker(futures::task::noop_waker_ref());
+            assert!(matches!(
+                waiting.as_mut().poll(&mut cx),
+                core::task::Poll::Pending
+            ));
+            assert_eq!(
+                std::sync::Arc::strong_count(&handle),
+                2,
+                "the wait should be holding the handle by now"
+            );
+        }
+
+        assert!(
+            handle_released(&handle).await,
+            "the handle was not given back when the caller went away"
+        );
+    }
+
+    /// Waits for nothing but this test to hold `handle`.
+    ///
+    /// The release happens on a task of its own, so this sleeps rather than yielding: yielding
+    /// hands the runtime back to this same future, which on a multi-threaded runtime can loop
+    /// through every attempt before another thread has picked the task up at all.
+    async fn handle_released(handle: &std::sync::Arc<()>) -> bool {
+        for _ in 0..1_000 {
+            if std::sync::Arc::strong_count(handle) == 1 {
+                return true;
+            }
+            fedimint_core::runtime::sleep(core::time::Duration::from_millis(5)).await;
+        }
+        false
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_swap_is_refused_when_no_client_is_in_place() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        // A detached federation has no client, exactly as one that was closed or erased.
+        let federation = FederationInner::detached(db, true);
+        let opened = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = opened.clone();
+
+        let err = federation
+            .replace_client(|| async move {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(crate::Error::new(ErrorCode::Internal, "never reached"))
+            })
+            .await
+            .expect_err("no client to replace");
+
+        assert_eq!(err.code, ErrorCode::FederationClosed);
+        assert!(
+            !opened.load(std::sync::atomic::Ordering::SeqCst),
+            "the swap must not open a client on a federation that has none"
+        );
+    }
+
+    #[test]
+    fn a_settle_claim_can_be_taken_only_once_per_client() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db, true);
+
+        let claimed = federation
+            .try_start_settle()
+            .expect("nothing is claimed yet");
+        assert!(federation.is_settling());
+        assert_eq!(
+            federation.try_start_settle(),
+            None,
+            "a second settle for the same client must not start"
+        );
+
+        federation.finish_settle(claimed);
+        assert!(!federation.is_settling());
+        assert_eq!(
+            federation.try_start_settle(),
+            Some(claimed),
+            "the claim is free again once the running settle concluded"
+        );
+    }
+
+    #[test]
+    fn finish_settle_ignores_an_identity_it_did_not_claim() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db, true);
+        let claimed = federation.try_start_settle().expect("first claim");
+
+        // A stale conclusion, from a settle that has already been superseded, must not clear a
+        // later claim it was never watching.
+        federation.finish_settle(claimed + 1);
+
+        assert!(
+            federation.is_settling(),
+            "a claim for a different identity must survive"
+        );
+    }
+
+    #[test]
+    fn recovery_progress_is_read_back_only_for_the_attempt_it_was_published_for() {
+        let db = federation_namespace(&in_memory_root(), [1u8; 32]);
+        let federation = FederationInner::detached(db, true);
+        let attempt = UpstreamOperationId([1u8; 32]);
+        let other_attempt = UpstreamOperationId([2u8; 32]);
+
+        assert_eq!(federation.recovery_progress_of(attempt), None);
+
+        let progress = RecoveryProgress {
+            complete: 3,
+            total: 10,
+        };
+        federation.publish_recovery_progress(attempt, progress);
+        assert_eq!(federation.recovery_progress_of(attempt), Some(progress));
+        assert_eq!(
+            federation.recovery_progress_of(other_attempt),
+            None,
+            "a different attempt never reads another attempt's published progress"
+        );
+
+        federation.reset_recovery_progress();
+        assert_eq!(federation.recovery_progress_of(attempt), None);
+    }
+}

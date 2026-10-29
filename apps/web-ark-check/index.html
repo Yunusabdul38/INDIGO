@@ -1,0 +1,16 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>INDIGO browser check</title>
+<pre id="out">running…</pre>
+<script type="module">
+  import init, { run } from "./pkg/web_ark_check.js";
+  const out = document.getElementById("out");
+  const q = new URLSearchParams(location.search);
+  try {
+    await init();
+    const show = (line) => { out.textContent = line; };
+    out.textContent = "OK " + (await run(q.get("network") || "signet", q.get("words"), q.get("action"), q.get("arg") || "", q.get("arg2") || "", show));
+  } catch (e) {
+    out.textContent = "FAIL " + (e && e.message ? e.message : e);
+  }
+</script>

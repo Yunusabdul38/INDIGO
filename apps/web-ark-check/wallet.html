@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>INDIGO Web Wallet</title>
+<style>
+  :root {
+    --brand: #4f46e5; --bg: #f2f2f7; --card: #fff; --text: #111; --muted: #6b6b70;
+    --line: #e5e5ea; --red: #d70015; --green: #1f8a3a; --orange: #c75c00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --brand: #7c74ff; --bg: #000; --card: #1c1c1e; --text: #f2f2f7; --muted: #98989f;
+            --line: #2c2c2e; --red: #ff6961; --green: #4cd964; --orange: #ff9f0a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+  main { max-width: 440px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 34px; margin: 8px 0 16px; }
+  h2 { font-size: 22px; font-weight: 600; margin: 0 0 8px; }
+  .card { background: var(--card); border-radius: 16px; padding: 16px; margin-bottom: 16px; }
+  .muted { color: var(--muted); }
+  .small { font-size: 13px; }
+  .balance { font-size: 38px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .row { display: flex; gap: 12px; }
+  .row > * { flex: 1; }
+  button { font: inherit; border: 0; border-radius: 999px; padding: 14px 16px; cursor: pointer; }
+  button.primary { background: var(--brand); color: #fff; font-weight: 600; width: 100%; }
+  button.link { background: none; color: var(--brand); padding: 8px; }
+  button:disabled { opacity: .4; cursor: default; }
+  input, textarea { font: inherit; width: 100%; padding: 10px 12px; border: 1px solid var(--line);
+                    border-radius: 10px; background: var(--card); color: var(--text); }
+  textarea { resize: vertical; }
+  label { display: block; margin: 12px 0 6px; font-size: 15px; }
+  .code { font: 12px ui-monospace, Menlo, monospace; word-break: break-all; background: var(--bg);
+          padding: 10px; border-radius: 10px; margin: 8px 0; }
+  .ok { color: var(--green); } .err { color: var(--red); } .warn { color: var(--orange); }
+  .tabs { display: flex; background: var(--bg); border-radius: 10px; padding: 2px; margin-bottom: 12px; }
+  .tabs button { flex: 1; border-radius: 8px; padding: 6px; background: none; color: var(--text); }
+  .tabs button.on { background: var(--card); font-weight: 600; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <section id="welcome" hidden>
+    <h1 style="color: var(--brand); text-align: center; margin-top: 48px">INDIGO</h1>
+    <p class="muted" style="text-align: center">The Ark pocket of an INDIGO wallet, running in this browser.</p>
+    <div class="card">
+      <label for="name">Your name</label>
+      <input id="name" autocomplete="off">
+      <div id="restore-box" hidden>
+        <label for="words-in">Your 12 recovery words</label>
+        <textarea id="words-in" rows="3" autocapitalize="off" spellcheck="false"></textarea>
+      </div>
+      <p></p>
+      <button class="primary" id="start">Create a new wallet</button>
+      <button class="link" id="toggle-restore">I have a recovery phrase</button>
+    </div>
+    <p class="muted small" style="text-align: center">Demo only: this page keeps your words in this browser's
+      storage. The INDIGO SDK keeps them in the platform's key store.</p>
+  </section>
+
+  <section id="home" hidden>
+    <h1 id="hello"></h1>
+    <div class="card">
+      <div class="muted small">Balance</div>
+      <div class="balance" id="balance">…</div>
+      <div class="muted small" id="pending"></div>
+      <p></p>
+      <div class="row">
+        <button class="primary" data-open="receive">Receive</button>
+        <button class="primary" data-open="send">Send</button>
+      </div>
+    </div>
+
+    <div class="card" id="receive" hidden>
+      <h2>Receive</h2>
+      <div class="tabs"><button class="on" data-tab="ln">Lightning</button><button data-tab="ark">Ark</button></div>
+      <div data-pane="ln">
+        <label for="recv-sats">Amount in sats</label>
+        <input id="recv-sats" inputmode="numeric" value="10000">
+        <p></p>
+        <button class="primary" id="recv-go">Create invoice</button>
+        <button class="link" id="faucet">Pay it from outside (test network)</button>
+      </div>
+      <div data-pane="ark" hidden>
+        <p class="muted small">Another Ark wallet pays this address directly, no Lightning needed.</p>
+        <div class="code" id="ark-address">…</div>
+        <button class="link" data-copy="ark-address">Copy</button>
+      </div>
+      <div id="recv-out"></div>
+    </div>
+
+    <div class="card" id="send" hidden>
+      <h2>Send</h2>
+      <label for="send-to">Lightning invoice or Ark address</label>
+      <textarea id="send-to" rows="3" spellcheck="false"></textarea>
+      <div id="send-amount-box" hidden>
+        <label for="send-sats">Amount in sats</label>
+        <input id="send-sats" inputmode="numeric">
+      </div>
+      <p></p>
+      <button class="primary" id="send-go">Send</button>
+      <div id="send-out"></div>
+    </div>
+
+    <div class="card">
+      <h2>Recovery phrase</h2>
+      <button class="link" id="show-words" style="padding-left: 0">Show my 12 words</button>
+      <div class="code" id="words" hidden></div>
+      <button class="link" id="forget" style="padding-left: 0; color: var(--red)">Delete this wallet from this browser</button>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+  import init, { run, new_words } from "./pkg/web_ark_check.js";
+
+  const OUTSIDE = "http://127.0.0.1:8733"; // demo/outside-world.py
+  const $ = (id) => document.getElementById(id);
+  const store = {
+    get: (k) => { try { return localStorage.getItem("indigo." + k); } catch { return null; } },
+    set: (k, v) => { try { localStorage.setItem("indigo." + k, v); } catch {} },
+    clear: () => { try { localStorage.removeItem("indigo.name"); localStorage.removeItem("indigo.words"); } catch {} },
+  };
+
+  // One wallet action at a time: each opens the wallet's IndexedDB store.
+  let queue = Promise.resolve();
+  const wallet = (action, arg = "", arg2 = "", show = () => {}) => {
+    const next = queue.then(() => run("regtest", store.get("words"), action, String(arg), String(arg2), show));
+    queue = next.catch(() => {});
+    return next;
+  };
+  const plain = (e) => (e && e.message ? e.message : String(e));
+  const sats = (n) => Number(n).toLocaleString("en-US", { maximumFractionDigits: 3 }) + " sats";
+  const say = (el, text, cls) => { el.className = cls || ""; el.textContent = text; };
+
+  async function refresh() {
+    try {
+      // "<n> sats spendable, <m> sats pending" (msat decimals possible)
+      const out = await wallet("balance");
+      const [spendable, pending] = out.match(/[\d.]+/g).map(Number);
+      $("balance").textContent = sats(spendable);
+      $("pending").textContent = pending > 0 ? sats(pending) + " on its way" : "";
+    } catch (e) { $("balance").textContent = "—"; $("pending").textContent = plain(e); }
+  }
+
+  function showHome() {
+    $("welcome").hidden = true;
+    $("home").hidden = false;
+    $("hello").textContent = "Hi, " + store.get("name");
+    refresh();
+  }
+
+  // Welcome
+  let restoring = false;
+  $("toggle-restore").onclick = () => {
+    restoring = !restoring;
+    $("restore-box").hidden = !restoring;
+    $("start").textContent = restoring ? "Restore my wallet" : "Create a new wallet";
+    $("toggle-restore").textContent = restoring ? "Create a new wallet instead" : "I have a recovery phrase";
+  };
+  $("start").onclick = () => {
+    const name = $("name").value.trim();
+    if (!name) return $("name").focus();
+    const words = restoring ? $("words-in").value.trim().toLowerCase().split(/\s+/).join(" ") : new_words();
+    if (words.split(" ").length !== 12) return alert("Those are not 12 recovery words.");
+    store.set("name", name);
+    store.set("words", words);
+    showHome();
+    if (!restoring) { $("words").hidden = false; $("words").textContent = words; }
+  };
+
+  // Panels
+  document.querySelectorAll("[data-open]").forEach((b) => (b.onclick = () => {
+    const id = b.dataset.open;
+    for (const p of ["receive", "send"]) $(p).hidden = p !== id || !$(p).hidden;
+    if (id === "receive" && $("ark-address").textContent === "…") loadAddress();
+  }));
+  document.querySelectorAll("[data-tab]").forEach((b) => (b.onclick = () => {
+    document.querySelectorAll("[data-tab]").forEach((t) => t.classList.toggle("on", t === b));
+    document.querySelectorAll("[data-pane]").forEach((p) => (p.hidden = p.dataset.pane !== b.dataset.tab));
+  }));
+  document.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = async () => {
+    await navigator.clipboard.writeText($(b.dataset.copy).textContent);
+    b.textContent = "Copied";
+  }));
+
+  async function loadAddress() {
+    try { $("ark-address").textContent = await wallet("address"); }
+    catch (e) { $("ark-address").textContent = plain(e); }
+  }
+
+  // Receive over Lightning: the page stays to claim it (an Ark server
+  // cancels a payment its wallet isn't there to take).
+  async function receive(payFromOutside) {
+    const out = $("recv-out");
+    const amount = parseInt($("recv-sats").value, 10);
+    if (!(amount > 0)) return;
+    $("recv-go").disabled = $("faucet").disabled = true;
+    say(out, "Creating invoice…", "muted small");
+    try {
+      const result = await wallet("receive-wait", amount, "", (line) => {
+        const invoice = line.replace(/^INVOICE /, "");
+        out.innerHTML = '<div class="code"></div><div class="muted small">Waiting for payment…</div>';
+        out.firstChild.textContent = invoice;
+        if (payFromOutside) {
+          fetch(OUTSIDE + "/pay", { method: "POST", body: JSON.stringify({ invoice }) })
+            .catch((e) => say(out, "The outside world is not running: " + plain(e), "err small"));
+        }
+      });
+      const done = /Completed/.test(result);
+      say(out, done ? "Received " + sats(amount) : "Not paid: " + result, done ? "ok" : "err small");
+    } catch (e) { say(out, plain(e), "err small"); }
+    $("recv-go").disabled = $("faucet").disabled = false;
+    refresh();
+  }
+  $("recv-go").onclick = () => receive(false);
+  $("faucet").onclick = () => receive(true);
+
+  // Send: an invoice carries its amount; an Ark address needs one.
+  const isInvoice = (t) => /^(lightning:)?ln(bc|tb|bcrt)/i.test(t);
+  $("send-to").oninput = () => {
+    const t = $("send-to").value.trim();
+    $("send-amount-box").hidden = !t || isInvoice(t);
+  };
+  $("send-go").onclick = async () => {
+    const to = $("send-to").value.trim().replace(/^lightning:/i, "");
+    const out = $("send-out");
+    if (!to) return;
+    $("send-go").disabled = true;
+    say(out, "Sending…", "muted small");
+    try {
+      const result = isInvoice(to)
+        ? await wallet("pay", to)
+        : await wallet("pay-address", to, parseInt($("send-sats").value, 10));
+      const done = /Completed/.test(result);
+      say(out, done ? "Paid" : "Payment " + result.split(" ").slice(1).join(" ").toLowerCase(), done ? "ok" : "warn small");
+    } catch (e) { say(out, plain(e), "err small"); }
+    $("send-go").disabled = false;
+    refresh();
+  };
+
+  // Recovery phrase
+  $("show-words").onclick = () => { $("words").textContent = store.get("words"); $("words").hidden = !$("words").hidden; };
+  $("forget").onclick = () => {
+    const name = store.get("name");
+    if (prompt(`This removes the wallet from this browser. Only the 12 words bring it back.\nType ${name} to confirm.`) !== name) return;
+    store.clear();
+    location.reload();
+  };
+
+  await init();
+  if (store.get("words")) showHome(); else $("welcome").hidden = false;
+</script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+[package]
+name = "web-ark-check"
+description = "Phase 3 test 3.12: the Bark pocket in a browser, its data in IndexedDB."
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Own workspace and lockfile: Bark's browser features need a newer
+# wasm-bindgen than fedimint-sdk allows in the main workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+indigo-domain = { path = "../../crates/domain" }
+indigo-rail = { path = "../../crates/rail" }
+indigo-rail-ark-bark = { path = "../../crates/rail-ark-bark" }
+indigo-testnets = { path = "../../crates/testnets" }
+bip39 = "2"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+bark-wallet = { version = "0.8.0", default-features = false, features = ["rand", "onchain-bdk", "wasm-web", "indexed-db"] }
+# Browser randomness: getrandom 0.2 and 0.3 each need their own switch.
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+
+[package.metadata.cargo-machete]
+# Only switch features on: Bark's browser backends and browser randomness.
+ignored = ["bark-wallet", "getrandom02", "getrandom03"]

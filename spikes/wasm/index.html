@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>indigo wasm spike</title>
+<pre id="out">running…</pre>
+<script type="module">
+  import init, { run } from "./pkg/spike_wasm.js";
+  const out = document.getElementById("out");
+  try {
+    await init();
+    const mint = new URLSearchParams(location.search).get("mint") || undefined;
+    out.textContent = "OK\n" + (await run(true, mint));
+  } catch (e) {
+    out.textContent = "FAIL\n" + (e && e.message ? e.message : e);
+  }
+</script>
