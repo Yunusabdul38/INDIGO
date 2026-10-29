@@ -1,0 +1,13 @@
+[env]
+# One minimum iOS version for Rust and the C code built by cc-rs (zstd, sqlite,
+# secp256k1). Without it they disagree and the link fails on ___chkstk_darwin.
+IPHONEOS_DEPLOYMENT_TARGET = "16.0"
+
+# Android (NDK r28+ rejects clang targets without an API level).
+# Fedimint forces aws-lc-sys's `bindgen` feature, and that bindgen run passes the
+# bare Rust triple to clang, so hand it a versioned one. Keep in step with -P in
+# `cargo ndk` (minimum Android API 26).
+"BINDGEN_EXTRA_CLANG_ARGS_aarch64-linux-android" = "--target=aarch64-linux-android26"
+"BINDGEN_EXTRA_CLANG_ARGS_x86_64-linux-android" = "--target=x86_64-linux-android26"
+# aws-lc-sys's CMake path cannot find the NDK; its plain cc builder works everywhere.
+AWS_LC_SYS_CMAKE_BUILDER = "0"

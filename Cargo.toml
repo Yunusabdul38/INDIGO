@@ -1,0 +1,80 @@
+[workspace]
+resolver = "3"
+# Spikes and the browser check keep their own lockfiles so they cannot move the main dependency set.
+exclude = ["spikes", "apps/web-ark-check"]
+members = [
+    "crates/domain",
+    "crates/rail",
+    "crates/rail-cashu",
+    "crates/rail-fedimint",
+    "crates/rail-ark-bark",
+    "crates/rail-ark-arkade",
+    "crates/store",
+    "crates/keys",
+    "crates/engine",
+    "crates/router",
+    "crates/core",
+    "crates/ffi",
+    "crates/testnets",
+    "apps/cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+indigo-domain = { path = "crates/domain" }
+indigo-rail = { path = "crates/rail" }
+indigo-rail-cashu = { path = "crates/rail-cashu" }
+indigo-rail-fedimint = { path = "crates/rail-fedimint" }
+indigo-rail-ark-bark = { path = "crates/rail-ark-bark" }
+indigo-rail-ark-arkade = { path = "crates/rail-ark-arkade" }
+indigo-store = { path = "crates/store" }
+indigo-keys = { path = "crates/keys" }
+indigo-engine = { path = "crates/engine" }
+indigo-router = { path = "crates/router" }
+indigo-core = { path = "crates/core" }
+indigo-testnets = { path = "crates/testnets" }
+
+anyhow = "1"
+async-trait = "0.1"
+bip39 = "2"
+clap = { version = "4", features = ["derive"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+sha2 = "0.10"
+thiserror = "2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
+uuid = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+
+# Protocol SDKs
+cdk = { version = "0.18.2", default-features = false, features = ["wallet"] }
+cdk-sqlite = { version = "0.18.2", default-features = false, features = ["wallet"] }
+# Same major as CDK, so bolt11 values pass between them without conversion.
+lightning-invoice = "0.34"
+# Exact pin: it is a beta and itself pins every fedimint crate to =0.13.0-beta.1.
+# Chosen over the raw crates in Phase 0 (see the plan doc's Fedimint decision).
+fedimint-sdk = "=0.1.0-beta.1"
+ark-client = { version = "0.12.0", default-features = false, features = ["tls-webpki-roots"] }
+ark-core = "0.12.0"
+ark-bdk-wallet = "0.12.0"
+# Android ships no public libsqlite3, so bundle it. CDK and Bark both use 0.31.
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Test 0.5: size-optimised build used for mobile binaries.
+[profile.mobile]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
