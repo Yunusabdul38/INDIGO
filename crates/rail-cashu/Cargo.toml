@@ -1,0 +1,17 @@
+[package]
+name = "indigo-rail-cashu"
+description = "The Cashu pocket: a Rail over CDK, one wallet per mint."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Storage is passed in (any CDK wallet database), so this crate keeps no
+# SQLite dependency of its own and can build for the browser later.
+[dependencies]
+indigo-domain.workspace = true
+indigo-rail.workspace = true
+async-trait.workspace = true
+cdk.workspace = true
+uuid.workspace = true
