@@ -1,0 +1,95 @@
+# Our own services on Mutinynet. Start with infra/mutinynet-setup.sh, which
+# creates the seeds, starts the mint, funds its Lightning node and opens a
+# channel. Ports are bound to 127.0.0.1 only. Test money only.
+#
+#   28085  Cashu mint (indigo --network mutinynet uses it by default)
+#   28091  the mint's Lightning node management pages
+#   28174  our single-guardian federation (28175: its guardian UI)
+#   28176  the federation's Lightning gateway (its own LDK node)
+#
+# The mint's seeds live in infra/.env.mutinynet (git-ignored). Losing that
+# file loses the node's test sats and channel, nothing else. The federation
+# and gateway keep theirs in their Docker volumes.
+# infra/mutinynet-federation-setup.sh sets up the federation and gateway.
+
+name: indigo-mutinynet
+
+services:
+  cdk-mint:
+    image: cashubtc/mintd:0.18.2-ldk-node
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        [ -f /root/.cdk-mintd/.initialized ] || {
+          cdk-mintd config init --new-mint --file /config/mint.toml &&
+          touch /root/.cdk-mintd/.initialized
+        } || exit 1
+        exec cdk-mintd
+    env_file: .env.mutinynet
+    # The Lightning node aborts start-up if Mutinynet's Esplora answers its
+    # first fee-estimate request in over 5 s, which happens now and then.
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8085/v1/info"]
+      interval: 5s
+      retries: 60
+    ports:
+      - "127.0.0.1:28085:8085"
+      - "127.0.0.1:28091:8091"
+    volumes:
+      - ./cdk-mint-mutinynet.toml:/config/mint.toml:ro
+      - cdk-mint:/root/.cdk-mintd
+
+  fedimintd:
+    image: fedimint/fedimintd:v0.12.2
+    restart: unless-stopped
+    environment:
+      FM_DATA_DIR: /data
+      FM_BITCOIN_NETWORK: signet
+      FM_ESPLORA_URL: https://mutinynet.com/api
+      FM_BIND_P2P: 0.0.0.0:8173
+      # The port the invite code names (28174), inside the container too: the
+      # gateway shares this container's network and reaches the API there.
+      FM_BIND_API: 0.0.0.0:28174
+      FM_BIND_UI: 0.0.0.0:8175
+      FM_P2P_URL: fedimint://fedimintd:8173
+      FM_API_URL: ws://127.0.0.1:28174
+      FM_ENABLE_IROH: "false"
+      FM_PASSWORD_UI: indigo
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8175"]
+      interval: 5s
+      retries: 20
+    ports:
+      - "127.0.0.1:28174:28174"
+      # The gateway's API (gatewayd runs in this container's network).
+      - "127.0.0.1:28176:8186"
+      - "127.0.0.1:28175:8175"
+    volumes:
+      - fedimintd:/data
+
+  gatewayd:
+    image: fedimint/gatewayd:v0.12.2
+    restart: unless-stopped
+    command: ["gatewayd", "ldk"]
+    environment:
+      FM_GATEWAY_DATA_DIR: /data
+      # 8176 is fedimintd's metrics port in the shared network.
+      FM_GATEWAY_LISTEN_ADDR: 0.0.0.0:8186
+      FM_GATEWAY_API_ADDR: http://127.0.0.1:28176
+      # bcrypt of "indigo" (gateway-cli create-password-hash indigo); test money only.
+      FM_GATEWAY_BCRYPT_PASSWORD_HASH: "$$2b$$12$$t9zjapNViPQgBNv2O3G.4.Nebx0/GQ9H55Xm6JwnQXHShASe/msqS"
+      FM_GATEWAY_NETWORK: signet
+      FM_ESPLORA_URL: https://mutinynet.com/api
+      FM_PORT_LDK: "9736"
+      FM_LDK_ALIAS: indigo-mutinynet-gateway
+    # In fedimintd's network: the invite code's 127.0.0.1 address works here.
+    network_mode: "service:fedimintd"
+    volumes:
+      - gatewayd:/data
+
+
+volumes:
+  cdk-mint:
+  fedimintd:
+  gatewayd:

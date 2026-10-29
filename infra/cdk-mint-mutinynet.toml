@@ -1,0 +1,36 @@
+# Our own Cashu mint on Mutinynet, with cdk-mintd's built-in Lightning node
+# (LDK). Imported once by `cdk-mintd config init --new-mint`
+# (see docker-compose.mutinynet.yml). Test money only.
+
+[info]
+url = "http://127.0.0.1:28085"
+listen_host = "0.0.0.0"
+listen_port = 8085
+mnemonic = "env:CDK_MINTD_MNEMONIC"
+
+[mint_info]
+name = "indigo-mutinynet"
+
+[payment_backend]
+backend = "ldk-node"
+
+[ldk_node]
+fee_percent = 0.01
+reserve_fee_min = 2
+# Mutinynet is a signet; all signets share one genesis block, so LDK's
+# "signet" works with Mutinynet's own Esplora and gossip server.
+bitcoin_network = "signet"
+chain_source_type = "esplora"
+esplora_url = "https://mutinynet.com/api"
+gossip_source_type = "rgs"
+rgs_url = "https://rgs.mutinynet.com/snapshot/0"
+storage_dir_path = "/root/.cdk-mintd/ldk"
+ldk_node_mnemonic = "env:CDK_MINTD_LDK_NODE_MNEMONIC"
+ldk_node_host = "0.0.0.0"
+ldk_node_port = 8090
+# The node's management pages: funding, channels, invoices, payments.
+webserver_host = "0.0.0.0"
+webserver_port = 8091
+
+[database]
+engine = "sqlite"

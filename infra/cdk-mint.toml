@@ -1,0 +1,23 @@
+# Regtest CDK mint. cdk-mintd 0.18 stores config in its database; this file is
+# imported once by `cdk-mintd config init --new-mint` (see docker-compose.regtest.yml).
+
+[info]
+url = "http://127.0.0.1:18085"
+listen_host = "0.0.0.0"
+listen_port = 8085
+mnemonic = "env:CDK_MINTD_MNEMONIC"
+
+[mint_info]
+name = "indigo-regtest"
+
+[payment_backend]
+backend = "lnd"
+
+# lnd-mint's files, mounted read-only from its volume.
+[lnd]
+address = "https://lnd-mint:10009"
+cert_file = "/lnd/tls.cert"
+macaroon_file = "/lnd/data/chain/bitcoin/regtest/admin.macaroon"
+
+[database]
+engine = "sqlite"

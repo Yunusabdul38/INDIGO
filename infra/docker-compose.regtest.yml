@@ -1,0 +1,324 @@
+# Local regtest stack for automated tests. Start with:
+#   docker compose -f infra/docker-compose.regtest.yml up -d
+#   infra/regtest-setup.sh
+#   indigo --network regtest status
+# Host ports are 18xxx so they don't collide with anything running natively, and
+# bound to 127.0.0.1 only: the credentials are test-only but fixed, so nothing is
+# reachable from the network. Esplora keeps 50002 because fedimintd's regtest
+# config points wallets there.
+
+name: indigo-regtest
+
+services:
+  bitcoind:
+    image: bitcoin/bitcoin:29.4
+    command:
+      - -regtest
+      - -server
+      - -txindex
+      - -rpcuser=indigo
+      - -rpcpassword=indigo
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -fallbackfee=0.0002
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+    ports:
+      - "127.0.0.1:18443:18443"
+    volumes:
+      - bitcoind:/home/bitcoin/.bitcoin
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=indigo", "-rpcpassword=indigo", "getblockchaininfo"]
+      interval: 5s
+      retries: 20
+
+  # Esplora HTTP API over bitcoind. Fedimint v1 wallet clients, BDK, Bark and
+  # Arkade all read the chain through it. Host port 50002 is where fedimintd's
+  # regtest config points clients by default.
+  esplora:
+    image: vulpemventures/electrs@sha256:0b7d01aafbb432a0042529ded7c9de8057c5ca65e0d2aaded4a0e2bd6d479ae7
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    command:
+      - -vv
+      - --network=regtest
+      - --daemon-rpc-addr=bitcoind:18443
+      - --cookie=indigo:indigo
+      - --http-addr=0.0.0.0:3000
+      - --electrum-rpc-addr=0.0.0.0:50001
+      - --jsonrpc-import
+      - --cors=*
+      - --db-dir=/data
+    # No healthcheck: the image has no curl, wget or nc. `indigo status` checks it.
+    ports:
+      - "127.0.0.1:50002:3000"
+    volumes:
+      - esplora:/data
+
+  # Three Lightning nodes, with channels opened by infra/regtest-setup.sh:
+  #   lnd          the outside world: tests pay and bill INDIGO from here
+  #   lnd-mint     the CDK mint's node
+  #   lnd-gateway  the Fedimint gateway's node
+  lnd:
+    image: lightninglabs/lnd:v0.20.5-beta
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    command:
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoind:18443
+      - --bitcoind.rpcuser=indigo
+      - --bitcoind.rpcpass=indigo
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      - --noseedbackup
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --tlsextradomain=lnd
+      - --alias=indigo-regtest
+    healthcheck:
+      test: ["CMD-SHELL", "lncli --network=regtest state | grep -q SERVER_ACTIVE"]
+      interval: 5s
+      retries: 30
+    ports:
+      - "127.0.0.1:18080:8080"
+      - "127.0.0.1:18009:10009"
+    volumes:
+      - lnd:/root/.lnd
+
+  lnd-mint:
+    image: lightninglabs/lnd:v0.20.5-beta
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    command:
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoind:18443
+      - --bitcoind.rpcuser=indigo
+      - --bitcoind.rpcpass=indigo
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      - --noseedbackup
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --tlsextradomain=lnd-mint
+      - --alias=indigo-mint
+    healthcheck:
+      test: ["CMD-SHELL", "lncli --network=regtest state | grep -q SERVER_ACTIVE"]
+      interval: 5s
+      retries: 30
+    ports:
+      - "127.0.0.1:18081:8080"
+      - "127.0.0.1:18010:10009"
+    volumes:
+      - lnd-mint:/root/.lnd
+
+  lnd-gateway:
+    image: lightninglabs/lnd:v0.20.5-beta
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    command:
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoind:18443
+      - --bitcoind.rpcuser=indigo
+      - --bitcoind.rpcpass=indigo
+      - --bitcoind.zmqpubrawblock=tcp://bitcoind:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoind:28333
+      - --noseedbackup
+      - --rpclisten=0.0.0.0:10009
+      - --restlisten=0.0.0.0:8080
+      - --tlsextradomain=lnd-gateway
+      - --alias=indigo-gateway
+    healthcheck:
+      test: ["CMD-SHELL", "lncli --network=regtest state | grep -q SERVER_ACTIVE"]
+      interval: 5s
+      retries: 30
+    ports:
+      - "127.0.0.1:18082:8080"
+      - "127.0.0.1:18011:10009"
+    volumes:
+      - lnd-gateway:/root/.lnd
+
+  # Cashu mint on lnd-mint.
+  cdk-mint:
+    image: cashubtc/mintd:0.18.2
+    depends_on:
+      lnd-mint:
+        condition: service_healthy
+    # 0.18 keeps config in its database: import infra/cdk-mint.toml on first start only.
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        [ -f /root/.cdk-mintd/.initialized ] || {
+          cdk-mintd config init --new-mint --file /config/mint.toml &&
+          touch /root/.cdk-mintd/.initialized
+        } || exit 1
+        exec cdk-mintd
+    environment:
+      CDK_MINTD_MNEMONIC: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8085/v1/info"]
+      interval: 5s
+      retries: 20
+    ports:
+      - "127.0.0.1:18085:8085"
+    volumes:
+      - ./cdk-mint.toml:/config/mint.toml:ro
+      - cdk-mint:/root/.cdk-mintd
+      - lnd-mint:/lnd:ro
+
+  # Single-guardian federation. Run infra/regtest-setup.sh once to complete DKG.
+  fedimintd:
+    image: fedimint/fedimintd:v0.12.2
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      FM_DATA_DIR: /data
+      FM_BITCOIN_NETWORK: regtest
+      FM_BITCOIND_URL: http://bitcoind:18443
+      FM_BITCOIND_USERNAME: indigo
+      FM_BITCOIND_PASSWORD: indigo
+      FM_BIND_P2P: 0.0.0.0:8173
+      # The port the invite code names (18174), inside the container too: the
+      # gateway shares this container's network and reaches the API there.
+      FM_BIND_API: 0.0.0.0:18174
+      FM_BIND_UI: 0.0.0.0:8175
+      FM_P2P_URL: fedimint://fedimintd:8173
+      FM_API_URL: ws://127.0.0.1:18174
+      # Legacy WebSocket stack, so plain HTTP tooling can reach the API.
+      FM_ENABLE_IROH: "false"
+      FM_PASSWORD_UI: indigo
+    # Healthy once the UI listens; DKG still needs infra/regtest-setup.sh.
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8175"]
+      interval: 5s
+      retries: 20
+    ports:
+      - "127.0.0.1:18174:18174"
+      # The gateway's API (gatewayd runs in this container's network).
+      - "127.0.0.1:18176:8186"
+      - "127.0.0.1:18175:8175"
+    volumes:
+      - fedimintd:/data
+
+  # Lightning gateway for the federation, on lnd-gateway. infra/regtest-setup.sh
+  # connects it to the federation and has the guardian vet it.
+  gatewayd:
+    image: fedimint/gatewayd:v0.12.2
+    depends_on:
+      lnd-gateway:
+        condition: service_healthy
+    command: ["gatewayd", "lnd"]
+    environment:
+      FM_GATEWAY_DATA_DIR: /data
+      # 8176 is fedimintd's metrics port in the shared network.
+      FM_GATEWAY_LISTEN_ADDR: 0.0.0.0:8186
+      FM_GATEWAY_API_ADDR: http://127.0.0.1:18176
+      # bcrypt of "indigo" (gateway-cli create-password-hash indigo)
+      FM_GATEWAY_BCRYPT_PASSWORD_HASH: "$$2b$$12$$t9zjapNViPQgBNv2O3G.4.Nebx0/GQ9H55Xm6JwnQXHShASe/msqS"
+      FM_GATEWAY_NETWORK: regtest
+      FM_BITCOIND_URL: http://bitcoind:18443
+      FM_BITCOIND_USERNAME: indigo
+      FM_BITCOIND_PASSWORD: indigo
+      FM_LND_RPC_ADDR: https://lnd-gateway:10009
+      FM_LND_TLS_CERT: /lnd/tls.cert
+      FM_LND_MACAROON: /lnd/data/chain/bitcoin/regtest/admin.macaroon
+      RUST_LOG: ${GATEWAY_LOG:-info}
+    # In fedimintd's network: the invite code's 127.0.0.1 address works here.
+    network_mode: "service:fedimintd"
+    volumes:
+      - gatewayd:/data
+      - lnd-gateway:/lnd:ro
+
+
+  # The Bark (Ark) server and its Lightning node. Core Lightning with the
+  # hold plugin is built from infra/bark/cln.Dockerfile (Second's own, from
+  # the bark repository); its certificates are made for the hostname `cln`.
+  bark-cln:
+    build:
+      context: ./bark
+      dockerfile: cln.Dockerfile
+    image: indigo/bark-cln:server-0.8.0
+    hostname: cln
+    restart: on-failure
+    entrypoint: ["/root/cln/start.sh"]
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    environment:
+      BITCOIN_RPCCONNECT: bitcoind:18443
+      BITCOIN_RPCUSER: indigo
+      BITCOIN_RPCPASSWORD: indigo
+      CLN_ALIAS: indigo-bark-cln
+      CLN_LOG_LEVEL: info
+    networks:
+      default:
+        aliases: [cln]
+    volumes:
+      - bark-cln:/root/.lightning
+
+  # captaind 0.8 needs bitcoind 31+. Rather than upgrade the node the rest of
+  # the stack was tested on, it gets its own, peered with ours: same chain.
+  bark-bitcoind:
+    image: bitcoin/bitcoin:31
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    command:
+      - -regtest
+      - -server
+      - -txindex
+      - -addnode=bitcoind:18444
+      - -rpcuser=indigo
+      - -rpcpassword=indigo
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -fallbackfee=0.0002
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=indigo", "-rpcpassword=indigo", "getblockchaininfo"]
+      interval: 5s
+      retries: 20
+    # Bark wallets read the chain here (our Esplora lacks package relay).
+    ports:
+      - "127.0.0.1:18453:18443"
+    volumes:
+      - bark-bitcoind:/home/bitcoin/.bitcoin
+
+  captaind:
+    # Only published for amd64: runs under emulation on Apple Silicon.
+    image: secondark/captaind:0.8.0
+    platform: linux/amd64
+    depends_on:
+      bark-bitcoind:
+        condition: service_healthy
+      bark-cln:
+        condition: service_started
+    environment:
+      CAPTAIND_CONFIG: /config/captaind.toml
+    ports:
+      - "127.0.0.1:18535:3535"
+    volumes:
+      - ./bark/captaind-regtest.toml:/config/captaind.toml:ro
+      - captaind:/data/captaind
+      - captaind-postgres:/var/lib/postgresql/data
+      - bark-cln:/data/cln:ro
+
+volumes:
+  esplora:
+  bitcoind:
+  lnd:
+  lnd-mint:
+  lnd-gateway:
+  cdk-mint:
+  gatewayd:
+  fedimintd:
+  bark-cln:
+  captaind:
+  captaind-postgres:
+  bark-bitcoind:
