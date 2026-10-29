@@ -28,3 +28,5 @@ demo/ios/build/
 demo/ios/Generated/
 demo/ios/IndigoFFI.xcframework/
 demo/ios/IndigoDemo.xcodeproj/
+# demo/start.sh logs
+demo/.run/
